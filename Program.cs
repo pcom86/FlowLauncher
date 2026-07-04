@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using Microsoft.Win32;
 
 namespace FlowLauncher;
 
@@ -111,6 +112,8 @@ class Program
             logError("PAD.Console.Host.exe not found. Install Power Automate Desktop or set Flow:PadConsoleHostPath.", null);
             return 1;
         }
+
+        ConfigureExternalRunConfirmation(config, log);
 
         log("Information", $"PAD console host path: {padPath}");
 
@@ -357,6 +360,41 @@ class Program
         }
 
         return null;
+    }
+
+    static void ConfigureExternalRunConfirmation(IConfiguration config, Action<string, string> log)
+    {
+        var disableConfirmation = config.GetValue<bool?>("Flow:DisableExternalConfirmation") ?? false;
+        if (!disableConfirmation)
+            return;
+
+        const string keyPath = @"SOFTWARE\Microsoft\Power Automate Desktop";
+
+        try
+        {
+            using (var hklmKey = Registry.LocalMachine.OpenSubKey(keyPath))
+            {
+                var enforced = hklmKey?.GetValue("ConfigureExternalRuns") as int?;
+                if (enforced == 1)
+                {
+                    log("Warning", "Admin policy (HKLM\\...\\Power Automate Desktop\\ConfigureExternalRuns=1) enforces the confirmation dialog on this machine; it cannot be disabled by FlowLauncher. Contact your Power Platform admin.");
+                    return;
+                }
+                if (enforced == 2)
+                {
+                    log("Warning", "Admin policy (HKLM\\...\\Power Automate Desktop\\ConfigureExternalRuns=2) blocks external flow invocation entirely on this machine. The flow will not run.");
+                    return;
+                }
+            }
+
+            using var hkcuKey = Registry.CurrentUser.CreateSubKey(keyPath);
+            hkcuKey.SetValue("EnableAskBeforeRunningAFlowExternally", 0, RegistryValueKind.DWord);
+            log("Information", "Disabled Power Automate's 'confirm external flow invocation' dialog via HKCU registry setting (EnableAskBeforeRunningAFlowExternally=0). NOTE: this is a machine-wide user setting that persists after this run and lowers the security bar for externally-triggered flows on this account.");
+        }
+        catch (Exception ex)
+        {
+            log("Warning", $"Failed to update the external-run confirmation registry setting: {ex.Message}");
+        }
     }
 
     static async Task<int> RunCloudFlow(IConfiguration config, Action<string, string> log, Action<string, Exception?> logError)

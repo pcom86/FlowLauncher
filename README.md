@@ -124,6 +124,7 @@ If you prefer to deploy manually:
 | `Flow:EnvironmentId` | Power Automate environment ID | No |
 | `Flow:AutoLogin` | Sign in silently with current Windows account | No (default: false) |
 | `Flow:RunId` | GUID used to name the on-disk run log folder | No |
+| `Flow:DisableExternalConfirmation` | Suppress the "An external process is trying to start the flow" dialog | No (default: false) |
 | `Flow:PadConsoleHostPath` | Full path to `PAD.Console.Host.exe`; leave empty to auto-detect | No |
 | `Flow:TimeoutMinutes` | Max wait time before abort | No (default: 30 Desktop / 5 Cloud) |
 | `Flow:ShowProgress` | Display live flow progress on the console | No (default: true) |
@@ -133,6 +134,25 @@ If you prefer to deploy manually:
 | `Flow:HttpHeaders` | Custom headers for HTTP request | No |
 | `Flow:HttpPayload` | JSON payload for HTTP POST | No |
 | `Logging:LogPath` | Path to log file | No |
+
+## Disabling the External Invocation Confirmation Dialog
+
+By default, Power Automate Desktop shows a **"Run flow: An external source is attempting to run the following flow..."** dialog whenever a flow is triggered via URL (which is how FlowLauncher invokes desktop flows). This blocks unattended/scheduled execution.
+
+Set `Flow:DisableExternalConfirmation` to `true` to have FlowLauncher automatically set the documented registry value before dispatching:
+
+| Hive | Key | Name | Value |
+|---|---|---|---|
+| `HKEY_CURRENT_USER` | `SOFTWARE\Microsoft\Power Automate Desktop` | `EnableAskBeforeRunningAFlowExternally` | `0` (DWORD) |
+
+This is equivalent to disabling **Display confirmation dialog when invoking flows externally** in the PAD console settings, and is the officially documented mechanism (see [Governance in Power Automate for desktop](https://learn.microsoft.com/power-automate/desktop-flows/governance#configure-power-automate-for-desktop-confirmation-dialog-when-invoking-flows-using-a-url-or-desktop-shortcut)).
+
+> [!WARNING]
+> Disabling this dialog is a security-relevant change: it allows **any** external URL/shortcut (not just FlowLauncher) to silently trigger flows on this Windows account going forward. Only enable it on trusted, dedicated automation machines.
+
+**Important constraints**:
+- **Admin policy overrides this.** If your Power Platform admin has set `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Power Automate Desktop\ConfigureExternalRuns` to `1` (dialog enforced) or `2` (external runs blocked entirely), FlowLauncher cannot override it — it will log a warning and leave the setting untouched.
+- **Licensing**: some community reports indicate the underlying console setting is only exposed with a Premium/Process license; without one, the dialog may still require manual confirmation for **unattended** runs regardless of this registry value, since unattended execution itself requires an unattended RDP session/Process license. See [Power Automate pricing](https://www.microsoft.com/power-platform/products/power-automate/pricing).
 
 ## Live Progress Display
 

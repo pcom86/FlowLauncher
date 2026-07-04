@@ -11,6 +11,8 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <TrimMode>partial</TrimMode>
     <AssemblyName>FlowLauncher</AssemblyName>
+    <!-- This application is Windows-only by design (Power Automate Desktop, Task Scheduler, Registry). -->
+    <NoWarn>$(NoWarn);CA1416;NU1510</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -20,6 +22,7 @@
     <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="9.0.4" />
     <PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.4" />
     <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="9.0.4" />
+    <PackageReference Include="Microsoft.Win32.Registry" Version="5.0.0" />
   </ItemGroup>
 
   <ItemGroup>
