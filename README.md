@@ -126,11 +126,20 @@ If you prefer to deploy manually:
 | `Flow:RunId` | GUID used to name the on-disk run log folder | No |
 | `Flow:PadConsoleHostPath` | Full path to `PAD.Console.Host.exe`; leave empty to auto-detect | No |
 | `Flow:TimeoutMinutes` | Max wait time before abort | No (default: 30 Desktop / 5 Cloud) |
+| `Flow:ShowProgress` | Display live flow progress on the console | No (default: true) |
+| `Flow:ProgressTimeoutMinutes` | Max time to wait/display progress after dispatch (Desktop only) | No (default: `TimeoutMinutes`) |
 | `Flow:Inputs` | Key-value inputs passed to desktop flow via `inputArguments` | No |
 | `Flow:HttpTriggerUrl` | Cloud flow HTTP trigger URL | For Cloud |
 | `Flow:HttpHeaders` | Custom headers for HTTP request | No |
 | `Flow:HttpPayload` | JSON payload for HTTP POST | No |
 | `Logging:LogPath` | Path to log file | No |
+
+## Live Progress Display
+
+When `Flow:ShowProgress` is `true` (default):
+
+- **Desktop flows**: FlowLauncher watches `%LOCALAPPDATA%\Microsoft\Power Automate Desktop\Console\Scripts\[FlowId]\Runs\[RunId]\Actions.log` and streams each new log line to the console as the flow executes. When Power Automate removes the run folder (which happens once the run finishes and its logs are pushed to the cloud), FlowLauncher reports the run as complete. If the folder can't be located within the timeout, a warning is logged but the flow may still be running.
+- **Cloud flows**: if the HTTP trigger responds with `202 Accepted` and a `Location` header (the standard Azure Logic Apps async pattern), FlowLauncher polls that URL every 2 seconds and prints the run's `status` field until it reaches a terminal state (`Succeeded`, `Failed`, `Cancelled`, `Aborted`) or the timeout elapses. If the trigger responds synchronously (e.g. `200 OK` with no `Location` header), there is nothing to poll and this step is skipped.
 
 ## Environment Variable Overrides
 

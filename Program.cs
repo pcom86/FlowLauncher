@@ -93,6 +93,11 @@ class Program
         var autoLogin = config.GetValue<bool?>("Flow:AutoLogin") ?? false;
         var runId = config["Flow:RunId"];
         var timeoutMinutes = config.GetValue<int?>("Flow:TimeoutMinutes") ?? 30;
+        var showProgress = config.GetValue<bool?>("Flow:ShowProgress") ?? true;
+        var progressTimeoutMinutes = config.GetValue<int?>("Flow:ProgressTimeoutMinutes") ?? timeoutMinutes;
+
+        if (string.IsNullOrWhiteSpace(runId))
+            runId = Guid.NewGuid().ToString();
 
         if (string.IsNullOrWhiteSpace(flowName) && string.IsNullOrWhiteSpace(workflowId))
         {
@@ -135,8 +140,7 @@ class Program
         if (autoLogin)
             queryParts.Add("autologin=true");
 
-        if (!string.IsNullOrWhiteSpace(runId))
-            queryParts.Add($"runId={runId}");
+        queryParts.Add($"runId={runId}");
 
         var runUrl = "ms-powerautomate:/console/flow/run?" + string.Join("&", queryParts);
 
@@ -210,7 +214,101 @@ class Program
         }
 
         log("Information", $"Desktop flow '{flowLabel}' dispatched successfully to Power Automate.");
+
+        if (showProgress)
+            await ShowDesktopFlowProgress(runId!, progressTimeoutMinutes, log);
+
         return 0;
+    }
+
+    static async Task ShowDesktopFlowProgress(string runId, int timeoutMinutes, Action<string, string> log)
+    {
+        var scriptsRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Microsoft", "Power Automate Desktop", "Console", "Scripts");
+
+        log("Information", $"Watching for run folder under '{scriptsRoot}' (RunId: {runId})");
+
+        var deadline = DateTime.UtcNow.AddMinutes(timeoutMinutes);
+        string? runFolder = null;
+
+        while (DateTime.UtcNow < deadline && runFolder == null)
+        {
+            if (Directory.Exists(scriptsRoot))
+            {
+                try
+                {
+                    runFolder = Directory.EnumerateDirectories(scriptsRoot, runId, SearchOption.AllDirectories).FirstOrDefault();
+                }
+                catch (IOException) { /* transient FS race, retry */ }
+            }
+
+            if (runFolder != null)
+                break;
+
+            var remaining = (deadline - DateTime.UtcNow).TotalSeconds;
+            Console.Write($"\rWaiting for flow run to start... ({Math.Max(0, remaining):F0}s remaining)   ");
+            await Task.Delay(1000);
+        }
+
+        Console.WriteLine();
+
+        if (runFolder == null)
+        {
+            log("Warning", "Could not locate the run log folder within the timeout window; progress display unavailable. The flow may still be running in the background.");
+            return;
+        }
+
+        log("Information", $"Run folder detected: {runFolder}");
+        var actionsLogPath = Path.Combine(runFolder, "Actions.log");
+        long lastPosition = 0;
+        var startTime = DateTime.UtcNow;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            if (!Directory.Exists(runFolder))
+            {
+                Console.WriteLine();
+                log("Information", "Run folder was removed - the flow run has finished (Power Automate cleans up logs after completion).");
+                return;
+            }
+
+            var readAnyLine = false;
+            if (File.Exists(actionsLogPath))
+            {
+                try
+                {
+                    using var fs = new FileStream(actionsLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    fs.Seek(lastPosition, SeekOrigin.Begin);
+                    using var reader = new StreamReader(fs);
+                    string? line;
+                    while ((line = await reader.ReadLineAsync()) != null)
+                    {
+                        if (string.IsNullOrWhiteSpace(line))
+                            continue;
+                        Console.WriteLine($"[Flow] {line}");
+                        log("Information", $"[Flow Progress] {line}");
+                        readAnyLine = true;
+                    }
+                    lastPosition = fs.Position;
+                }
+                catch (IOException)
+                {
+                    // Actions.log may be momentarily locked by PAD; retry on next tick.
+                }
+            }
+
+            if (!readAnyLine)
+            {
+                var elapsed = DateTime.UtcNow - startTime;
+                Console.Write($"\rFlow running... elapsed {elapsed:mm\\:ss}   ");
+            }
+
+            await Task.Delay(1000);
+        }
+
+        Console.WriteLine();
+        log("Warning", $"Timed out after {timeoutMinutes} minutes waiting for the desktop flow run to finish. It may still be running.");
     }
 
     static string? ResolvePadConsoleHostPath(IConfiguration config, Action<string, string> log)
@@ -320,6 +418,17 @@ class Program
             }
 
             log("Information", "Cloud flow triggered successfully.");
+
+            var showProgress = config.GetValue<bool?>("Flow:ShowProgress") ?? true;
+            if (showProgress && response.StatusCode == System.Net.HttpStatusCode.Accepted && response.Headers.Location != null)
+            {
+                await PollCloudFlowStatus(response.Headers.Location.ToString(), timeoutMinutes, log);
+            }
+            else if (showProgress)
+            {
+                log("Information", "No async status URL (202 + Location header) was returned, so live progress polling is unavailable for this trigger. The flow was still dispatched.");
+            }
+
             return 0;
         }
         catch (TaskCanceledException ex) when (ex.InnerException is TimeoutException || client.Timeout.TotalMilliseconds > 0)
@@ -332,6 +441,66 @@ class Program
             logError($"HTTP request failed: {ex.Message}", ex);
             return 1;
         }
+    }
+
+    static async Task PollCloudFlowStatus(string statusUrl, int timeoutMinutes, Action<string, string> log)
+    {
+        using var client = new HttpClient();
+        var deadline = DateTime.UtcNow.AddMinutes(timeoutMinutes);
+        var startTime = DateTime.UtcNow;
+        var lastStatus = string.Empty;
+
+        log("Information", $"Polling flow run status at: {statusUrl}");
+
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                using var resp = await client.GetAsync(statusUrl);
+                var body = await resp.Content.ReadAsStringAsync();
+                var status = "Unknown";
+
+                try
+                {
+                    using var doc = JsonDocument.Parse(body);
+                    if (doc.RootElement.TryGetProperty("status", out var statusProp))
+                        status = statusProp.GetString() ?? "Unknown";
+                }
+                catch (JsonException)
+                {
+                    // Response body isn't JSON or doesn't contain a status field; keep polling with "Unknown".
+                }
+
+                if (!string.Equals(status, lastStatus, StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine();
+                    Console.WriteLine($"[Flow] Status: {status}");
+                    log("Information", $"Cloud flow status changed: {status}");
+                    lastStatus = status;
+                }
+                else
+                {
+                    var elapsed = DateTime.UtcNow - startTime;
+                    Console.Write($"\rFlow status: {status} | elapsed {elapsed:mm\\:ss}   ");
+                }
+
+                if (status is "Succeeded" or "Failed" or "Cancelled" or "Aborted")
+                {
+                    Console.WriteLine();
+                    log("Information", $"Cloud flow reached terminal state: {status}");
+                    return;
+                }
+            }
+            catch (HttpRequestException ex)
+            {
+                log("Warning", $"Error while polling flow status (will retry): {ex.Message}");
+            }
+
+            await Task.Delay(2000);
+        }
+
+        Console.WriteLine();
+        log("Warning", $"Timed out after {timeoutMinutes} minutes waiting for the cloud flow to reach a terminal state.");
     }
 }
 
