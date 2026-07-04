@@ -262,7 +262,6 @@ class Program
         var deadline = DateTime.UtcNow.AddMinutes(timeoutMinutes);
         string? runFolder = null;
 
-        // Track existing folders at start so we can detect new ones.
         var existingFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (Directory.Exists(scriptsRoot))
         {
@@ -274,16 +273,20 @@ class Program
             catch (IOException) { /* transient */ }
         }
 
+        Console.WriteLine();
+        Console.WriteLine("  ┌─────────────────────────────────────────────┐");
+        Console.WriteLine("  │          FLOW PROGRESS MONITOR              │");
+        Console.WriteLine("  └─────────────────────────────────────────────┘");
+        Console.WriteLine();
+
         while (DateTime.UtcNow < deadline && runFolder == null)
         {
             if (Directory.Exists(scriptsRoot))
             {
                 try
                 {
-                    // 1) Try exact runId match first.
                     runFolder = Directory.EnumerateDirectories(scriptsRoot, runId, SearchOption.AllDirectories).FirstOrDefault();
 
-                    // 2) If not found, look for any new folder created after we started.
                     if (runFolder == null)
                     {
                         foreach (var d in Directory.EnumerateDirectories(scriptsRoot, "*", SearchOption.AllDirectories))
@@ -291,7 +294,7 @@ class Program
                             if (!existingFolders.Contains(d))
                             {
                                 runFolder = d;
-                                log("Information", $"Found new run folder (not exact runId match): {runFolder}");
+                                log("Information", $"Found new run folder: {runFolder}");
                                 break;
                             }
                         }
@@ -304,7 +307,7 @@ class Program
                 break;
 
             var remaining = (deadline - DateTime.UtcNow).TotalSeconds;
-            Console.Write($"\rWaiting for flow run to start... ({Math.Max(0, remaining):F0}s remaining)   ");
+            Console.Write($"\r  ⏳ Waiting for flow to start... {Math.Max(0, remaining):F0}s remaining   ");
             await Task.Delay(2000);
         }
 
@@ -312,11 +315,17 @@ class Program
 
         if (runFolder == null)
         {
-            var msg = "Could not locate the run log folder within the timeout window; progress display unavailable. The flow may still be running in the background.";
+            var msg = "Could not locate the run log folder within the timeout window. The flow may still be running in the background.";
+            Console.WriteLine($"  ⚠️  {msg}");
             log("Warning", msg);
             summary.Warnings.Add(msg);
             return;
         }
+
+        Console.WriteLine($"  ✅ Run folder detected");
+        Console.WriteLine($"  📁 {runFolder}");
+        Console.WriteLine();
+        Console.WriteLine("  ┌─ Flow Actions ──────────────────────────────┐");
 
         log("Information", $"Run folder detected: {runFolder}");
         summary.RunFolderPath = runFolder;
@@ -324,13 +333,16 @@ class Program
         long lastPosition = 0;
         var startTime = DateTime.UtcNow;
         var lastLogTime = DateTime.UtcNow;
+        int stepCount = 0;
 
         while (DateTime.UtcNow < deadline)
         {
             if (!Directory.Exists(runFolder))
             {
+                Console.WriteLine("  └─────────────────────────────────────────────┘");
                 Console.WriteLine();
-                log("Information", "Run folder was removed - the flow run has finished (Power Automate cleans up logs after completion).");
+                Console.WriteLine($"  ✅ Flow completed — run folder cleaned up by Power Automate.");
+                log("Information", "Run folder was removed - the flow run has finished.");
                 return;
             }
 
@@ -347,31 +359,33 @@ class Program
                     {
                         if (string.IsNullOrWhiteSpace(line))
                             continue;
-                        Console.WriteLine($"[Flow] {line}");
+                        stepCount++;
+                        var time = DateTime.Now.ToString("HH:mm:ss");
+                        var display = line.Length > 43 ? line[..40] + "..." : line;
+                        Console.WriteLine($"  │ #{stepCount,3} │ {time} │ {display}");
                         log("Information", $"[Flow Progress] {line}");
                         readAnyLine = true;
                         lastLogTime = DateTime.UtcNow;
                     }
                     lastPosition = fs.Position;
                 }
-                catch (IOException)
-                {
-                    // Actions.log may be momentarily locked by PAD; retry on next tick.
-                }
+                catch (IOException) { /* Actions.log may be momentarily locked */ }
             }
 
             if (!readAnyLine)
             {
                 var elapsed = DateTime.UtcNow - startTime;
                 var sinceLastLog = DateTime.UtcNow - lastLogTime;
-                Console.Write($"\rFlow running... elapsed {elapsed:mm\\:ss} (last activity {sinceLastLog:ss}s ago)   ");
+                Console.Write($"\r  │ {stepCount} actions completed │ elapsed {elapsed:mm\\:ss} │ idle {sinceLastLog:ss}s    ");
             }
 
             await Task.Delay(2000);
         }
 
+        Console.WriteLine("  └─────────────────────────────────────────────┘");
         Console.WriteLine();
-        var timeoutMsg = $"Timed out after {timeoutMinutes} minutes waiting for the desktop flow run to finish. It may still be running.";
+        var timeoutMsg = $"Timed out after {timeoutMinutes} minutes. The flow may still be running.";
+        Console.WriteLine($"  ⚠️  {timeoutMsg}");
         log("Warning", timeoutMsg);
         summary.Warnings.Add(timeoutMsg);
     }
@@ -615,6 +629,12 @@ class Program
         var startTime = DateTime.UtcNow;
         var lastStatus = string.Empty;
 
+        Console.WriteLine();
+        Console.WriteLine("  ┌─────────────────────────────────────────────┐");
+        Console.WriteLine("  │          CLOUD FLOW STATUS MONITOR          │");
+        Console.WriteLine("  └─────────────────────────────────────────────┘");
+        Console.WriteLine();
+
         log("Information", $"Polling flow run status at: {statusUrl}");
 
         while (DateTime.UtcNow < deadline)
@@ -631,27 +651,25 @@ class Program
                     if (doc.RootElement.TryGetProperty("status", out var statusProp))
                         status = statusProp.GetString() ?? "Unknown";
                 }
-                catch (JsonException)
-                {
-                    // Response body isn't JSON or doesn't contain a status field; keep polling with "Unknown".
-                }
+                catch (JsonException) { /* non-JSON response */ }
 
                 if (!string.Equals(status, lastStatus, StringComparison.OrdinalIgnoreCase))
                 {
-                    Console.WriteLine();
-                    Console.WriteLine($"[Flow] Status: {status}");
+                    Console.WriteLine($"  📊 Status: {status}");
                     log("Information", $"Cloud flow status changed: {status}");
                     lastStatus = status;
                 }
                 else
                 {
                     var elapsed = DateTime.UtcNow - startTime;
-                    Console.Write($"\rFlow status: {status} | elapsed {elapsed:mm\\:ss}   ");
+                    Console.Write($"\r  ⏳ Status: {status} │ elapsed {elapsed:mm\\:ss}    ");
                 }
 
                 if (status is "Succeeded" or "Failed" or "Cancelled" or "Aborted")
                 {
                     Console.WriteLine();
+                    var icon = status == "Succeeded" ? "✅" : "❌";
+                    Console.WriteLine($"  {icon} Cloud flow reached terminal state: {status}");
                     log("Information", $"Cloud flow reached terminal state: {status}");
                     summary.FinalAsyncStatus = status;
                     return;
@@ -669,6 +687,7 @@ class Program
 
         Console.WriteLine();
         var timeoutMsg = $"Timed out after {timeoutMinutes} minutes waiting for the cloud flow to reach a terminal state.";
+        Console.WriteLine($"  ⚠️  {timeoutMsg}");
         log("Warning", timeoutMsg);
         summary.Warnings.Add(timeoutMsg);
     }
@@ -959,56 +978,65 @@ public class FlowSummary
 
     public void Print()
     {
+        var duration = Duration;
+        var resultIcon = ExitCode == 0 ? "✅" : "❌";
+        var resultText = ExitCode == 0 ? "SUCCESS" : "FAILED";
+
         Console.WriteLine();
-        Console.WriteLine(new string('=', 70));
-        Console.WriteLine("  FLOW EXECUTION SUMMARY");
-        Console.WriteLine(new string('=', 70));
-        Console.WriteLine($"  Flow Type:        {FlowType ?? "Unknown"}");
-        Console.WriteLine($"  Flow Identifier:  {FlowIdentifier ?? "N/A"}");
-        Console.WriteLine($"  Start Time:       {StartTime:yyyy-MM-dd HH:mm:ss}");
-        Console.WriteLine($"  End Time:         {(EndTime.HasValue ? EndTime.Value.ToString("yyyy-MM-dd HH:mm:ss") : "N/A")}");
-        Console.WriteLine($"  Duration:         {Duration:hh\\:mm\\:ss}");
-        Console.WriteLine($"  Overall Result:   {(ExitCode == 0 ? "SUCCESS" : "FAILED")} (Exit Code: {ExitCode})");
-        Console.WriteLine(new string('-', 70));
+        Console.WriteLine("  ╔═════════════════════════════════════════════╗");
+        Console.WriteLine("  ║          FLOW EXECUTION SUMMARY             ║");
+        Console.WriteLine("  ╚═════════════════════════════════════════════╝");
+        Console.WriteLine();
+        Console.WriteLine($"  {resultIcon} Result:          {resultText} (exit code {ExitCode})");
+        Console.WriteLine($"  📋 Flow:           {FlowIdentifier ?? "N/A"}");
+        Console.WriteLine($"  🔧 Type:           {FlowType ?? "Unknown"}");
+        Console.WriteLine($"  🕐 Started:        {StartTime:yyyy-MM-dd HH:mm:ss}");
+        Console.WriteLine($"  🏁 Ended:          {(EndTime.HasValue ? EndTime.Value.ToString("yyyy-MM-dd HH:mm:ss") : "N/A")}");
+        Console.WriteLine($"  ⏱️  Duration:        {duration:hh\\:mm\\:ss}");
+        Console.WriteLine("  ───────────────────────────────────────────────");
 
         if (FlowType?.Equals("desktop", StringComparison.OrdinalIgnoreCase) == true)
         {
-            Console.WriteLine($"  PAD Path:         {PadPath ?? "N/A"}");
-            Console.WriteLine($"  Run ID:           {RunId ?? "N/A"}");
-            Console.WriteLine($"  PAD Exit Code:    {PadExitCode?.ToString() ?? "N/A"}");
-            Console.WriteLine($"  Dispatch Status:  {(DispatchSucceeded ? "Dispatched" : "Failed")}");
-            Console.WriteLine($"  Confirmation:     {(ConfirmationChanged ? "Disabled (registry changed)" : "Unchanged")}");
-            Console.WriteLine($"  PAD Restarted:    {(PadRestarted ? "Yes" : "No")}");
-            Console.WriteLine($"  Dialog Confirmed: {(DialogAutoConfirmed ? "Yes (auto-clicked)" : "No")}");
+            Console.WriteLine();
+            Console.WriteLine("  📦 Desktop Flow Details:");
+            Console.WriteLine($"     PAD Path:       {PadPath ?? "N/A"}");
+            Console.WriteLine($"     Run ID:         {RunId ?? "N/A"}");
+            Console.WriteLine($"     Dispatched:     {(DispatchSucceeded ? "✅ Yes" : "❌ No")}");
+            Console.WriteLine($"     Dialog Confirmed: {(DialogAutoConfirmed ? "✅ Yes (auto)" : "❌ No")}");
+            Console.WriteLine($"     Registry:       {(ConfirmationChanged ? "Modified" : "Unchanged")}");
+            Console.WriteLine($"     PAD Restarted:  {(PadRestarted ? "Yes" : "No")}");
             if (!string.IsNullOrWhiteSpace(RunFolderPath))
-                Console.WriteLine($"  Run Log Folder:   {RunFolderPath}");
+                Console.WriteLine($"     Log Folder:     {RunFolderPath}");
         }
         else if (FlowType?.Equals("cloud", StringComparison.OrdinalIgnoreCase) == true)
         {
-            Console.WriteLine($"  Trigger URL:      {TriggerUrl ?? "N/A"}");
-            Console.WriteLine($"  HTTP Status:      {HttpStatusCode?.ToString() ?? "N/A"}");
-            Console.WriteLine($"  Async Polling:    {(HasAsyncPolling ? "Yes" : "No")}");
+            Console.WriteLine();
+            Console.WriteLine("  ☁️ Cloud Flow Details:");
+            Console.WriteLine($"     Trigger URL:    {TriggerUrl ?? "N/A"}");
+            Console.WriteLine($"     HTTP Status:    {HttpStatusCode?.ToString() ?? "N/A"}");
+            Console.WriteLine($"     Async Polling:  {(HasAsyncPolling ? "Yes" : "No")}");
             if (!string.IsNullOrWhiteSpace(FinalAsyncStatus))
-                Console.WriteLine($"  Final Status:     {FinalAsyncStatus}");
+                Console.WriteLine($"     Final Status:   {FinalAsyncStatus}");
         }
 
         if (Errors.Count > 0)
         {
-            Console.WriteLine(new string('-', 70));
-            Console.WriteLine($"  ERRORS ({Errors.Count}):");
+            Console.WriteLine();
+            Console.WriteLine($"  ❌ Errors ({Errors.Count}):");
             foreach (var error in Errors)
-                Console.WriteLine($"    - {error}");
+                Console.WriteLine($"     • {error}");
         }
 
         if (Warnings.Count > 0)
         {
-            Console.WriteLine(new string('-', 70));
-            Console.WriteLine($"  WARNINGS ({Warnings.Count}):");
+            Console.WriteLine();
+            Console.WriteLine($"  ⚠️  Warnings ({Warnings.Count}):");
             foreach (var warning in Warnings)
-                Console.WriteLine($"    - {warning}");
+                Console.WriteLine($"     • {warning}");
         }
 
-        Console.WriteLine(new string('=', 70));
+        Console.WriteLine();
+        Console.WriteLine("  ═══════════════════════════════════════════════");
         Console.WriteLine();
     }
 }
