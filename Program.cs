@@ -96,6 +96,7 @@ class Program
         var timeoutMinutes = config.GetValue<int?>("Flow:TimeoutMinutes") ?? 30;
         var showProgress = config.GetValue<bool?>("Flow:ShowProgress") ?? true;
         var progressTimeoutMinutes = config.GetValue<int?>("Flow:ProgressTimeoutMinutes") ?? timeoutMinutes;
+        var forceRestartPad = config.GetValue<bool?>("Flow:ForceRestartPad") ?? false;
 
         if (string.IsNullOrWhiteSpace(runId))
             runId = Guid.NewGuid().ToString();
@@ -113,7 +114,10 @@ class Program
             return 1;
         }
 
-        ConfigureExternalRunConfirmation(config, log);
+        var confirmationChanged = ConfigureExternalRunConfirmation(config, log);
+
+        if (confirmationChanged || forceRestartPad)
+            EnsurePadRestarted(forceRestartPad, log);
 
         log("Information", $"PAD console host path: {padPath}");
 
@@ -362,11 +366,11 @@ class Program
         return null;
     }
 
-    static void ConfigureExternalRunConfirmation(IConfiguration config, Action<string, string> log)
+    static bool ConfigureExternalRunConfirmation(IConfiguration config, Action<string, string> log)
     {
         var disableConfirmation = config.GetValue<bool?>("Flow:DisableExternalConfirmation") ?? false;
         if (!disableConfirmation)
-            return;
+            return false;
 
         const string keyPath = @"SOFTWARE\Microsoft\Power Automate Desktop";
 
@@ -378,23 +382,85 @@ class Program
                 if (enforced == 1)
                 {
                     log("Warning", "Admin policy (HKLM\\...\\Power Automate Desktop\\ConfigureExternalRuns=1) enforces the confirmation dialog on this machine; it cannot be disabled by FlowLauncher. Contact your Power Platform admin.");
-                    return;
+                    return false;
                 }
                 if (enforced == 2)
                 {
                     log("Warning", "Admin policy (HKLM\\...\\Power Automate Desktop\\ConfigureExternalRuns=2) blocks external flow invocation entirely on this machine. The flow will not run.");
-                    return;
+                    return false;
                 }
             }
 
             using var hkcuKey = Registry.CurrentUser.CreateSubKey(keyPath);
+            var existing = hkcuKey.GetValue("EnableAskBeforeRunningAFlowExternally") as int?;
+            if (existing == 0)
+            {
+                log("Information", "Registry setting EnableAskBeforeRunningAFlowExternally is already 0 (dialog already disabled).");
+                return false;
+            }
+
             hkcuKey.SetValue("EnableAskBeforeRunningAFlowExternally", 0, RegistryValueKind.DWord);
             log("Information", "Disabled Power Automate's 'confirm external flow invocation' dialog via HKCU registry setting (EnableAskBeforeRunningAFlowExternally=0). NOTE: this is a machine-wide user setting that persists after this run and lowers the security bar for externally-triggered flows on this account.");
+            return true;
         }
         catch (Exception ex)
         {
             log("Warning", $"Failed to update the external-run confirmation registry setting: {ex.Message}");
+            return false;
         }
+    }
+
+    static void EnsurePadRestarted(bool forceRestart, Action<string, string> log)
+    {
+        var padProcessNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "PAD.Console.Host",
+            "PAD.Designer",
+            "PowerAutomateDesktop",
+            "PowerAutomateDesktop.Console"
+        };
+
+        var padProcesses = Process.GetProcesses()
+            .Where(p =>
+            {
+                try { return padProcessNames.Contains(p.ProcessName); }
+                catch { return false; }
+            })
+            .ToList();
+
+        if (padProcesses.Count == 0)
+        {
+            log("Information", "No PAD processes detected; registry change should take effect immediately.");
+            return;
+        }
+
+        var processNames = string.Join(", ", padProcesses.Select(p => $"{p.ProcessName} (PID {p.Id})"));
+        log("Warning", $"PAD processes are currently running: {processNames}. Power Automate caches the confirmation-dialog setting in memory, so the dialog may still appear unless PAD is restarted.");
+
+        if (!forceRestart)
+        {
+            log("Information", "Set Flow:ForceRestartPad=true to have FlowLauncher automatically terminate running PAD processes before triggering the flow. This ensures the registry change is picked up, but may interrupt other active flows.");
+            return;
+        }
+
+        log("Warning", "Flow:ForceRestartPad=true — terminating running PAD processes so the new registry setting takes effect...");
+        foreach (var proc in padProcesses)
+        {
+            try
+            {
+                proc.Kill();
+                proc.WaitForExit(5000);
+                log("Information", $"Terminated {proc.ProcessName} (PID {proc.Id}).");
+            }
+            catch (Exception ex)
+            {
+                log("Warning", $"Failed to terminate {proc.ProcessName} (PID {proc.Id}): {ex.Message}");
+            }
+        }
+
+        // Give PAD a moment to fully shut down before we try to start a new flow.
+        Thread.Sleep(2000);
+        log("Information", "PAD processes terminated. Proceeding with flow dispatch.");
     }
 
     static async Task<int> RunCloudFlow(IConfiguration config, Action<string, string> log, Action<string, Exception?> logError)

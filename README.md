@@ -139,7 +139,9 @@ If you prefer to deploy manually:
 
 By default, Power Automate Desktop shows a **"Run flow: An external source is attempting to run the following flow..."** dialog whenever a flow is triggered via URL (which is how FlowLauncher invokes desktop flows). This blocks unattended/scheduled execution.
 
-Set `Flow:DisableExternalConfirmation` to `true` to have FlowLauncher automatically set the documented registry value before dispatching:
+### Step 1: Disable the registry setting
+
+Set `Flow:DisableExternalConfirmation` to `true`. FlowLauncher will write:
 
 | Hive | Key | Name | Value |
 |---|---|---|---|
@@ -149,6 +151,17 @@ This is equivalent to disabling **Display confirmation dialog when invoking flow
 
 > [!WARNING]
 > Disabling this dialog is a security-relevant change: it allows **any** external URL/shortcut (not just FlowLauncher) to silently trigger flows on this Windows account going forward. Only enable it on trusted, dedicated automation machines.
+
+### Step 2: Restart Power Automate Desktop
+
+**Critical**: Power Automate Desktop **caches the confirmation-dialog setting in memory** when it starts. Simply changing the registry value is not enough — if PAD is already running, it will continue to show the dialog until it is restarted.
+
+FlowLauncher handles this automatically:
+- If no PAD processes are running, the registry change takes effect immediately.
+- If PAD processes **are** running, FlowLauncher logs a warning and explains the situation.
+- Set `Flow:ForceRestartPad` to `true` to have FlowLauncher **automatically terminate** any running PAD processes before triggering the flow. This ensures the new registry setting is picked up, but may interrupt other active flows.
+
+**Recommended approach for scheduled tasks**: Set both `DisableExternalConfirmation: true` and `ForceRestartPad: true` in your `appsettings.json` so the scheduled task can reliably run unattended without manual intervention.
 
 **Important constraints**:
 - **Admin policy overrides this.** If your Power Platform admin has set `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Power Automate Desktop\ConfigureExternalRuns` to `1` (dialog enforced) or `2` (external runs blocked entirely), FlowLauncher cannot override it — it will log a warning and leave the setting untouched.
