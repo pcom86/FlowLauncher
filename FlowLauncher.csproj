@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PublishSingleFile>true</PublishSingleFile>
@@ -11,6 +11,7 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <TrimMode>partial</TrimMode>
     <AssemblyName>FlowLauncher</AssemblyName>
+    <UseWindowsForms>true</UseWindowsForms>
     <!-- This application is Windows-only by design (Power Automate Desktop, Task Scheduler, Registry). -->
     <NoWarn>$(NoWarn);CA1416;NU1510</NoWarn>
   </PropertyGroup>

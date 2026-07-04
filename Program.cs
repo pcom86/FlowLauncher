@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Configuration;
@@ -673,147 +674,259 @@ class Program
     }
 
     // ------------------------------------------------------------------
-    // UI-Automation fallback: auto-confirm PAD dialogs via PowerShell.
-    // Uses UIAutomationClient which works with modern WinUI/WPF/WebView2
-    // dialogs that Win32 FindWindow cannot reliably detect.
+    // UI-Automation fallback: auto-confirm PAD dialogs.
+    // Uses System.Windows.Forms.SendKeys + minimal P/Invoke for window detection.
     // ------------------------------------------------------------------
 
     static async Task AutoConfirmRunFlowDialog(int timeoutSeconds, Action<string, string> log, FlowSummary summary)
     {
-        log("Information", $"Auto-confirm: spawning PowerShell UI automation watcher (up to {timeoutSeconds}s).");
+        log("Information", $"Auto-confirm: starting dialog watcher (up to {timeoutSeconds}s).");
 
-        // Write the PowerShell script to a temp file to avoid escaping issues.
-        var scriptPath = Path.Combine(Path.GetTempPath(), $"flowlauncher_autoconfirm_{Guid.NewGuid():N}.ps1");
-        try
+        var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+        var confirmed = new HashSet<IntPtr>();
+        int dialogsConfirmed = 0;
+
+        var titleKeywords = new[]
         {
-            await File.WriteAllTextAsync(scriptPath, BuildAutoConfirmPsScript());
+            "external source", "attempting to run", "run flow", "Run Flow",
+            "Power Automate", "input", "Input", "confirm", "Confirm",
+            "parameters", "Parameters", "variables", "Variables",
+            "enter values", "Enter values"
+        };
 
-            var psi = new ProcessStartInfo
+        while (DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(800);
+
+            try
             {
-                FileName = "powershell.exe",
-                Arguments = $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{scriptPath}\"",
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            };
-
-            psi.EnvironmentVariables["AUTO_CONFIRM_TIMEOUT"] = timeoutSeconds.ToString();
-
-            using var ps = new Process { StartInfo = psi };
-            ps.OutputDataReceived += (_, e) =>
-            {
-                if (string.IsNullOrWhiteSpace(e.Data)) return;
-                var line = e.Data.Trim();
-
-                if (line.StartsWith("DIALOG_DETECTED|"))
-                    log("Information", $"Auto-confirm: detected dialog '{line["DIALOG_DETECTED|".Length..]}'.");
-                else if (line.StartsWith("BUTTON_CLICKED|"))
+                // Find all visible top-level windows that match our keywords.
+                var matches = new List<(IntPtr hWnd, string title)>();
+                EnumWindows((hWnd, _) =>
                 {
-                    log("Information", $"Auto-confirm: clicked button '{line["BUTTON_CLICKED|".Length..]}'.");
-                    summary.DialogAutoConfirmed = true;
-                }
-                else if (line.StartsWith("BUTTON_CLICK_FAILED|"))
-                    log("Warning", $"Auto-confirm: button click failed: {line["BUTTON_CLICK_FAILED|".Length..]}");
-                else if (line == "ENTER_KEY_SENT")
-                {
-                    log("Information", "Auto-confirm: Enter key sent as fallback.");
-                    summary.DialogAutoConfirmed = true;
-                }
-                else if (line.StartsWith("ENTER_KEY_FAILED|"))
-                    log("Warning", $"Auto-confirm: Enter key failed: {line["ENTER_KEY_FAILED|".Length..]}");
-                else if (line == "AUTO_CONFIRM_DONE")
-                    log("Information", "Auto-confirm: PowerShell watcher finished.");
-            };
-            ps.ErrorDataReceived += (_, e) =>
-            {
-                if (!string.IsNullOrWhiteSpace(e.Data))
-                    log("Warning", $"Auto-confirm PS stderr: {e.Data.Trim()}");
-            };
+                    if (!IsWindowVisible(hWnd)) return true;
+                    if (confirmed.Contains(hWnd)) return true;
 
-            ps.Start();
-            ps.BeginOutputReadLine();
-            ps.BeginErrorReadLine();
+                    var sb = new StringBuilder(512);
+                    GetWindowText(hWnd, sb, sb.Capacity);
+                    var title = sb.ToString();
+                    if (string.IsNullOrWhiteSpace(title)) return true;
 
-            await ps.WaitForExitAsync();
-        }
-        catch (Exception ex)
-        {
-            log("Warning", $"Auto-confirm: failed to run PowerShell watcher: {ex.Message}");
-        }
-        finally
-        {
-            try { if (File.Exists(scriptPath)) File.Delete(scriptPath); } catch { /* ignored */ }
-        }
-    }
-
-    static string BuildAutoConfirmPsScript() => """
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
-$root = [System.Windows.Automation.AutomationElement]::RootElement
-$confirmed = @{}
-$deadline = (Get-Date).AddSeconds($env:AUTO_CONFIRM_TIMEOUT)
-
-while ((Get-Date) -lt $deadline) {
-    Start-Sleep -Milliseconds 800
-
-    $windows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
-
-    foreach ($win in $windows) {
-        $winId = $win.Current.NativeWindowHandle
-        if ($confirmed.ContainsKey($winId)) { continue }
-
-        $name = $win.Current.Name
-        if ([string]::IsNullOrWhiteSpace($name)) { continue }
-
-        $isPadDialog = $false
-        $patterns = @('external source','attempting to run','run flow','Run Flow','Power Automate','input','Input','confirm','Confirm','parameters','Parameters','variables','Variables','enter values','Enter values')
-        foreach ($p in $patterns) {
-            if ($name -like "*$p*") { $isPadDialog = $true; break }
-        }
-        if (-not $isPadDialog) { continue }
-
-        Write-Host "DIALOG_DETECTED|$name"
-
-        $btnCondition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
-        $buttons = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCondition)
-
-        $clicked = $false
-        foreach ($btn in $buttons) {
-            $btnName = $btn.Current.Name
-            $invokePatterns = @('Run flow','Run Flow','Run','OK','Confirm','Continue','Yes','Start','Accept','Submit')
-            foreach ($ip in $invokePatterns) {
-                if ($btnName -like "*$ip*") {
-                    try {
-                        $invoker = $btn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-                        $invoker.Invoke()
-                        Write-Host "BUTTON_CLICKED|$btnName"
-                        $clicked = $true
-                        break
-                    } catch {
-                        Write-Host "BUTTON_CLICK_FAILED|$btnName|$($_.Exception.Message)"
+                    foreach (var kw in titleKeywords)
+                    {
+                        if (title.Contains(kw, StringComparison.OrdinalIgnoreCase))
+                        {
+                            matches.Add((hWnd, title));
+                            break;
+                        }
                     }
+                    return true;
+                }, IntPtr.Zero);
+
+                if (matches.Count == 0)
+                {
+                    // Also check for buttons with matching text inside any visible window.
+                    var buttonHwnd = FindButtonInUnconfirmedWindows(confirmed, log);
+                    if (buttonHwnd != IntPtr.Zero)
+                    {
+                        var parentHwnd = GetAncestor(buttonHwnd, GA_ROOT);
+                        var parentTitle = GetWindowTitle(parentHwnd);
+                        log("Information", $"Auto-confirm: found button in window '{parentTitle}'. Clicking...");
+
+                        try
+                        {
+                            SendMessage(buttonHwnd, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+                            summary.DialogAutoConfirmed = true;
+                            dialogsConfirmed++;
+                            log("Information", $"Auto-confirm: dialog #{dialogsConfirmed} confirmed via button click.");
+                        }
+                        catch (Exception ex)
+                        {
+                            log("Warning", $"Auto-confirm: button click failed: {ex.Message}");
+                        }
+
+                        if (parentHwnd != IntPtr.Zero)
+                            confirmed.Add(parentHwnd);
+                        await Task.Delay(1500);
+                        continue;
+                    }
+
+                    continue;
+                }
+
+                foreach (var (hWnd, title) in matches)
+                {
+                    if (confirmed.Contains(hWnd)) continue;
+
+                    log("Information", $"Auto-confirm: detected dialog '{title}' (hWnd={hWnd}).");
+
+                    // Try to find and click a button inside this window.
+                    var clicked = TryClickButton(hWnd, log);
+
+                    if (!clicked)
+                    {
+                        // Fallback: bring to foreground and send Enter key.
+                        try
+                        {
+                            ShowWindow(hWnd, SW_RESTORE);
+                            await Task.Delay(100);
+                            SetForegroundWindow(hWnd);
+                            await Task.Delay(300);
+                            System.Windows.Forms.SendKeys.SendWait("{ENTER}");
+                            log("Information", "Auto-confirm: Enter key sent as fallback.");
+                            clicked = true;
+                        }
+                        catch (Exception ex)
+                        {
+                            log("Warning", $"Auto-confirm: Enter key fallback failed: {ex.Message}");
+                        }
+                    }
+
+                    if (clicked)
+                    {
+                        summary.DialogAutoConfirmed = true;
+                        dialogsConfirmed++;
+                    }
+
+                    confirmed.Add(hWnd);
+                    await Task.Delay(1500);
                 }
             }
-            if ($clicked) { break }
-        }
-
-        if (-not $clicked) {
-            try {
-                Add-Type -AssemblyName System.Windows.Forms
-                [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-                Write-Host "ENTER_KEY_SENT"
-            } catch {
-                Write-Host "ENTER_KEY_FAILED|$($_.Exception.Message)"
+            catch (Exception ex)
+            {
+                log("Warning", $"Auto-confirm: transient error: {ex.Message}");
             }
         }
 
-        $confirmed[$winId] = $true
-        Start-Sleep -Milliseconds 1500
+        log("Information", $"Auto-confirm: finished. Confirmed {dialogsConfirmed} dialog(s) total.");
     }
-}
-Write-Host "AUTO_CONFIRM_DONE"
-""";
+
+    static bool TryClickButton(IntPtr parentHwnd, Action<string, string> log)
+    {
+        var buttonKeywords = new[]
+        {
+            "Run flow", "Run Flow", "Run", "OK", "Confirm",
+            "Continue", "Yes", "Start", "Accept", "Submit"
+        };
+
+        foreach (var kw in buttonKeywords)
+        {
+            var btn = FindWindowEx(parentHwnd, IntPtr.Zero, "Button", kw);
+            if (btn == IntPtr.Zero)
+            {
+                // Try partial match via EnumChildWindows.
+                btn = FindChildButtonByText(parentHwnd, kw);
+            }
+
+            if (btn != IntPtr.Zero)
+            {
+                try
+                {
+                    SendMessage(btn, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+                    log("Information", $"Auto-confirm: clicked button '{kw}'.");
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    log("Warning", $"Auto-confirm: failed to click button '{kw}': {ex.Message}");
+                }
+            }
+        }
+        return false;
+    }
+
+    static IntPtr FindChildButtonByText(IntPtr parentHwnd, string text)
+    {
+        IntPtr found = IntPtr.Zero;
+        EnumChildWindows(parentHwnd, (child, _) =>
+        {
+            var sb = new StringBuilder(256);
+            GetWindowText(child, sb, sb.Capacity);
+            if (sb.ToString().Contains(text, StringComparison.OrdinalIgnoreCase))
+            {
+                found = child;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    static IntPtr FindButtonInUnconfirmedWindows(HashSet<IntPtr> confirmed, Action<string, string> log)
+    {
+        var buttonKeywords = new[]
+        {
+            "Run flow", "Run Flow", "Run", "OK", "Confirm",
+            "Continue", "Yes", "Start", "Accept", "Submit"
+        };
+
+        IntPtr foundButton = IntPtr.Zero;
+        EnumWindows((hWnd, _) =>
+        {
+            if (!IsWindowVisible(hWnd)) return true;
+            if (confirmed.Contains(hWnd)) return true;
+
+            foreach (var kw in buttonKeywords)
+            {
+                var btn = FindWindowEx(hWnd, IntPtr.Zero, "Button", kw);
+                if (btn == IntPtr.Zero)
+                    btn = FindChildButtonByText(hWnd, kw);
+
+                if (btn != IntPtr.Zero)
+                {
+                    foundButton = btn;
+                    return false;
+                }
+            }
+            return true;
+        }, IntPtr.Zero);
+        return foundButton;
+    }
+
+    static string GetWindowTitle(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero) return "(none)";
+        var sb = new StringBuilder(512);
+        GetWindowText(hWnd, sb, sb.Capacity);
+        return sb.ToString();
+    }
+
+    // --- P/Invoke declarations ---
+    const int SW_RESTORE = 9;
+    const int BM_CLICK = 0x00F5;
+    const int GA_ROOT = 2;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern IntPtr FindWindow(string? lpClassName, string? lpWindowName);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    [DllImport("user32.dll")]
+    static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern IntPtr FindWindowEx(IntPtr hwndParent, IntPtr hwndChildAfter, string? lpszClass, string? lpszWindow);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    static extern IntPtr GetAncestor(IntPtr hwnd, int gaFlags);
 }
 
 public class FlowSummary
