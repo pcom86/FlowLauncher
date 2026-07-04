@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Configuration;
@@ -87,48 +88,72 @@ class Program
     static async Task<int> RunDesktopFlow(IConfiguration config, Action<string, string> log, Action<string, Exception?> logError)
     {
         var flowName = config["Flow:Name"];
-        var padPath = config["Flow:PadConsoleHostPath"]
-            ?? @"C:\Program Files (x86)\Power Automate Desktop\PAD.Console.Host.exe";
+        var workflowId = config["Flow:WorkflowId"];
+        var environmentId = config["Flow:EnvironmentId"];
+        var autoLogin = config.GetValue<bool?>("Flow:AutoLogin") ?? false;
+        var runId = config["Flow:RunId"];
         var timeoutMinutes = config.GetValue<int?>("Flow:TimeoutMinutes") ?? 30;
 
-        if (string.IsNullOrWhiteSpace(flowName))
+        if (string.IsNullOrWhiteSpace(flowName) && string.IsNullOrWhiteSpace(workflowId))
         {
-            logError("Configuration missing: Flow:Name is required for desktop flows.", null);
+            logError("Configuration missing: Flow:Name or Flow:WorkflowId is required for desktop flows.", null);
+            return 1;
+        }
+
+        var padPath = ResolvePadConsoleHostPath(config, log);
+        if (padPath == null)
+        {
+            logError("PAD.Console.Host.exe not found. Install Power Automate Desktop or set Flow:PadConsoleHostPath.", null);
             return 1;
         }
 
         log("Information", $"PAD console host path: {padPath}");
-        log("Information", $"PAD console host exists: {File.Exists(padPath)}");
 
-        if (!File.Exists(padPath))
-        {
-            logError($"PAD.Console.Host.exe not found at '{padPath}'. Install Power Automate Desktop or set Flow:PadConsoleHostPath.", null);
-            return 1;
-        }
+        // PAD.Console.Host.exe is invoked with a single ms-powerautomate: run URL,
+        // NOT with custom flags like -run/-inputs. See:
+        // https://learn.microsoft.com/power-automate/desktop-flows/run-desktop-flows-url-shortcuts
+        var queryParts = new List<string>();
 
-        var arguments = $"-run \"{flowName}\"";
+        if (!string.IsNullOrWhiteSpace(workflowId))
+            queryParts.Add($"workflowId={workflowId}");
+        else
+            queryParts.Add($"workflowName={Uri.EscapeDataString(flowName!)}");
 
-        var inputs = config.GetSection("Flow:Inputs").Get<Dictionary<string, string?>>();
+        if (!string.IsNullOrWhiteSpace(environmentId))
+            queryParts.Add($"environmentid={environmentId}");
+
+        var inputs = config.GetSection("Flow:Inputs").Get<Dictionary<string, object?>>();
         if (inputs != null && inputs.Count > 0)
         {
             var inputsJson = JsonSerializer.Serialize(inputs);
-            arguments += $" -inputs {inputsJson}";
+            // The run URL requires the JSON to have its double quotes backslash-escaped.
+            var escapedInputs = inputsJson.Replace("\"", "\\\"");
+            queryParts.Add($"inputArguments={escapedInputs}");
             log("Information", $"Flow inputs: {inputsJson}");
         }
 
-        log("Information", $"Starting desktop flow '{flowName}' with timeout {timeoutMinutes} minutes.");
-        log("Information", $"Process arguments: {arguments}");
+        if (autoLogin)
+            queryParts.Add("autologin=true");
+
+        if (!string.IsNullOrWhiteSpace(runId))
+            queryParts.Add($"runId={runId}");
+
+        var runUrl = "ms-powerautomate:/console/flow/run?" + string.Join("&", queryParts);
+
+        log("Information", $"Starting desktop flow with timeout {timeoutMinutes} minutes.");
+        log("Information", $"Run URL: {runUrl}");
+        log("Information", "Note: PAD.Console.Host.exe hands off to Power Automate and exits immediately; its exit code does not reflect the flow's actual run result. Use 'Flow:RunId' plus the on-disk logs to verify completion if needed.");
 
         var psi = new ProcessStartInfo
         {
             FileName = padPath,
-            Arguments = arguments,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
             CreateNoWindow = true,
             WorkingDirectory = Path.GetDirectoryName(padPath) ?? AppContext.BaseDirectory
         };
+        psi.ArgumentList.Add(runUrl);
 
         using var process = new Process { StartInfo = psi };
 
@@ -176,14 +201,64 @@ class Program
 
         log("Information", $"PAD exit code: {process.ExitCode}");
 
+        var flowLabel = flowName ?? workflowId;
+
         if (process.ExitCode != 0)
         {
-            logError($"Desktop flow '{flowName}' exited with code {process.ExitCode}.", null);
+            logError($"PAD.Console.Host.exe exited with non-zero code {process.ExitCode} while dispatching flow '{flowLabel}'. This indicates the handoff itself failed (e.g. malformed URL); it does not confirm whether the flow ran.", null);
             return process.ExitCode;
         }
 
-        log("Information", $"Desktop flow '{flowName}' completed successfully.");
+        log("Information", $"Desktop flow '{flowLabel}' dispatched successfully to Power Automate.");
         return 0;
+    }
+
+    static string? ResolvePadConsoleHostPath(IConfiguration config, Action<string, string> log)
+    {
+        var configuredPath = config["Flow:PadConsoleHostPath"];
+        if (!string.IsNullOrWhiteSpace(configuredPath))
+        {
+            log("Information", $"Configured PAD console host path: {configuredPath} | Exists: {File.Exists(configuredPath)}");
+            return File.Exists(configuredPath) ? configuredPath : null;
+        }
+
+        var candidates = new[]
+        {
+            @"C:\Program Files (x86)\Power Automate Desktop\dotnet\PAD.Console.Host.exe",
+            @"C:\Program Files\Power Automate Desktop\dotnet\PAD.Console.Host.exe",
+            @"C:\Program Files (x86)\Power Automate Desktop\PAD.Console.Host.exe",
+            @"C:\Program Files\Power Automate Desktop\PAD.Console.Host.exe"
+        };
+
+        foreach (var candidate in candidates)
+        {
+            log("Information", $"Probing for PAD console host at: {candidate} | Exists: {File.Exists(candidate)}");
+            if (File.Exists(candidate))
+                return candidate;
+        }
+
+        var windowsAppsRoot = @"C:\Program Files\WindowsApps";
+        if (Directory.Exists(windowsAppsRoot))
+        {
+            try
+            {
+                var storeMatch = Directory.GetDirectories(windowsAppsRoot, "Microsoft.PowerAutomateDesktop_*")
+                    .SelectMany(dir => Directory.GetFiles(dir, "PAD.Console.Host.exe", SearchOption.AllDirectories))
+                    .FirstOrDefault();
+
+                if (storeMatch != null)
+                {
+                    log("Information", $"Found Microsoft Store PAD console host at: {storeMatch}");
+                    return storeMatch;
+                }
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // WindowsApps folder often blocks enumeration without elevated access; ignore and fall through.
+            }
+        }
+
+        return null;
     }
 
     static async Task<int> RunCloudFlow(IConfiguration config, Action<string, string> log, Action<string, Exception?> logError)

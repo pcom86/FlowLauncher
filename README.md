@@ -47,7 +47,11 @@ Edit `appsettings.json` to match your flow.
   "Flow": {
     "Type": "Desktop",
     "Name": "My Desktop Flow",
-    "PadConsoleHostPath": "C:\\Program Files (x86)\\Power Automate Desktop\\PAD.Console.Host.exe",
+    "WorkflowId": "",
+    "EnvironmentId": "",
+    "AutoLogin": false,
+    "RunId": "",
+    "PadConsoleHostPath": "",
     "TimeoutMinutes": 30,
     "Inputs": {
       "InputVariable1": "Hello from FlowLauncher"
@@ -58,6 +62,10 @@ Edit `appsettings.json` to match your flow.
   }
 }
 ```
+
+> **How desktop flow triggering works**: FlowLauncher invokes `PAD.Console.Host.exe` with a single `ms-powerautomate:/console/flow/run?...` run URL — this is the only invocation format PAD's console host supports. There is **no** synchronous "wait for flow completion" via this method: the host process hands off to Power Automate and exits almost immediately, so a `0` exit code only confirms the *handoff* succeeded, not that the flow finished successfully. To verify actual completion, set `Flow:RunId` to a GUID and inspect the corresponding log folder under `C:\Users\[User]\AppData\Local\Microsoft\Power Automate Desktop\Console\Scripts\[Flow ID]\Runs\[Run ID]`.
+>
+> Leave `PadConsoleHostPath` empty to let FlowLauncher auto-detect the install location (MSI or Microsoft Store). Set `WorkflowId`/`EnvironmentId` instead of `Name` if you have Premium licensing and prefer ID-based addressing (more stable than flow display names).
 
 #### Cloud Flow Example
 
@@ -111,10 +119,14 @@ If you prefer to deploy manually:
 | Setting | Description | Required |
 |---------|-------------|----------|
 | `Flow:Type` | `Desktop` or `Cloud` | Yes |
-| `Flow:Name` | Desktop flow display name | For Desktop |
-| `Flow:PadConsoleHostPath` | Full path to `PAD.Console.Host.exe` | Desktop only |
+| `Flow:Name` | Desktop flow display name (used unless `WorkflowId` is set) | For Desktop, unless `WorkflowId` set |
+| `Flow:WorkflowId` | Desktop flow ID (Premium license required); takes precedence over `Name` | No |
+| `Flow:EnvironmentId` | Power Automate environment ID | No |
+| `Flow:AutoLogin` | Sign in silently with current Windows account | No (default: false) |
+| `Flow:RunId` | GUID used to name the on-disk run log folder | No |
+| `Flow:PadConsoleHostPath` | Full path to `PAD.Console.Host.exe`; leave empty to auto-detect | No |
 | `Flow:TimeoutMinutes` | Max wait time before abort | No (default: 30 Desktop / 5 Cloud) |
-| `Flow:Inputs` | Key-value inputs passed to desktop flow | No |
+| `Flow:Inputs` | Key-value inputs passed to desktop flow via `inputArguments` | No |
 | `Flow:HttpTriggerUrl` | Cloud flow HTTP trigger URL | For Cloud |
 | `Flow:HttpHeaders` | Custom headers for HTTP request | No |
 | `Flow:HttpPayload` | JSON payload for HTTP POST | No |
