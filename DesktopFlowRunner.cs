@@ -241,10 +241,10 @@ static class DesktopFlowRunner
         log("Information", $"Run folder detected: {runFolder}");
         summary.RunFolderPath = runFolder;
         var actionsLogPath = Path.Combine(runFolder, "Actions.log");
-        long lastPosition = 0;
         var startTime = DateTime.UtcNow;
         var lastLogTime = DateTime.UtcNow;
         int stepCount = 0;
+        int linesShown = 0;
 
         while (DateTime.UtcNow < deadline)
         {
@@ -262,18 +262,26 @@ static class DesktopFlowRunner
             {
                 try
                 {
-                    using var fs = new FileStream(actionsLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                    fs.Seek(lastPosition, SeekOrigin.Begin);
-                    using var reader = new StreamReader(fs);
-                    string? line;
-                    while ((line = await reader.ReadLineAsync()) != null)
+                    // Read all lines each iteration and skip already-shown ones.
+                    // This avoids StreamReader buffering position issues that
+                    // caused the progress to get stuck.
+                    var allLines = await File.ReadAllLinesAsync(actionsLogPath);
+                    for (int i = 0; i < allLines.Length; i++)
                     {
-                        if (string.IsNullOrWhiteSpace(line))
+                        if (i < linesShown)
                             continue;
+                        var line = allLines[i];
+                        if (string.IsNullOrWhiteSpace(line))
+                        {
+                            linesShown++;
+                            continue;
+                        }
 
                         log("Information", $"[Flow Progress] {line}");
 
                         var display = ExtractActionName(line);
+                        linesShown++;
+
                         if (display == null)
                             continue;
 
@@ -284,7 +292,6 @@ static class DesktopFlowRunner
                         readAnyLine = true;
                         lastLogTime = DateTime.UtcNow;
                     }
-                    lastPosition = fs.Position;
                 }
                 catch (IOException) { }
             }
@@ -320,7 +327,8 @@ static class DesktopFlowRunner
                 using var doc = JsonDocument.Parse(trimmed);
                 var root = doc.RootElement;
 
-                foreach (var field in new[] { "actionName", "ActionName", "name", "Name", "action", "Action", "description", "Description", "message", "Message" })
+                // Try common field names first.
+                foreach (var field in new[] { "actionName", "ActionName", "name", "Name", "action", "Action", "description", "Description", "message", "Message", "text", "Text", "title", "Title", "stepName", "StepName" })
                 {
                     if (root.TryGetProperty(field, out var prop) && prop.ValueKind == JsonValueKind.String)
                     {
@@ -329,11 +337,26 @@ static class DesktopFlowRunner
                             return val;
                     }
                 }
-                return null;
+
+                // Fallback: return first string property value.
+                foreach (var prop in root.EnumerateObject())
+                {
+                    if (prop.Value.ValueKind == JsonValueKind.String)
+                    {
+                        var val = prop.Value.GetString();
+                        if (!string.IsNullOrWhiteSpace(val))
+                            return val;
+                    }
+                }
+
+                // If no string properties, return a summary of the JSON keys.
+                var keys = string.Join(", ", root.EnumerateObject().Select(p => p.Name));
+                return string.IsNullOrWhiteSpace(keys) ? null : $"{{{keys}}}";
             }
             catch (JsonException) { }
         }
 
+        // Plain text — filter out obvious metadata/noise.
         var lower = trimmed.ToLowerInvariant();
         if (lower.StartsWith("log ") || lower.StartsWith("timestamp:") ||
             lower.StartsWith("run id:") || lower.StartsWith("flow id:") ||
