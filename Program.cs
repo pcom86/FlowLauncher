@@ -652,14 +652,9 @@ class Program
     static async Task AutoConfirmRunFlowDialog(int timeoutSeconds, Action<string, string> log, FlowSummary summary)
     {
         var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
-        log("Information", $"Auto-confirm fallback active: watching for confirmation dialog (up to {timeoutSeconds}s).");
+        log("Information", $"Auto-confirm fallback active: watching for PAD dialogs (up to {timeoutSeconds}s).");
 
-        // ------------------------------------------------------------------
-        // Step 0: Wait for PAD.Console.Host.exe to actually start.
-        // When launching via shell/protocol, there can be a 1-3s delay
-        // before PAD spawns. Looking for the dialog before PAD exists
-        // wastes part of our timeout budget.
-        // ------------------------------------------------------------------
+        // Wait for PAD.Console.Host.exe to actually start.
         var padStarted = await WaitForPadProcess(15, log);
         if (!padStarted)
         {
@@ -667,20 +662,16 @@ class Program
             return;
         }
 
-        // Diagnostic: list visible top-level windows (helps us tune title matching).
+        // Diagnostic: list visible top-level windows.
         var debugTitles = GetVisibleWindowTitles();
         if (debugTitles.Count > 0)
         {
             log("Information", "Visible top-level windows at start: " + string.Join(" | ", debugTitles.Take(10)));
         }
 
-        // PAD confirmation dialogs use a variety of titles.
-        var titlePatterns = new[]
+        // Patterns for the confirmation dialog ("An external source...").
+        var confirmPatterns = new[]
         {
-            "Run flow",
-            "Run Flow",
-            "Power Automate",
-            "Microsoft Power Automate",
             "An external source is attempting to run",
             "An external process",
             "External Process",
@@ -690,56 +681,96 @@ class Program
             "Confirm Action"
         };
 
+        // Patterns for the inputs / "Run flow" dialog.
+        var runPatterns = new[]
+        {
+            "Run flow",
+            "Run Flow",
+            "Power Automate",
+            "Microsoft Power Automate"
+        };
+
+        // All patterns combined for broad matching.
+        var allPatterns = confirmPatterns.Concat(runPatterns).ToArray();
+
+        // Track windows we've already confirmed so we don't confirm the same one twice.
+        var confirmedWindows = new HashSet<IntPtr>();
+        int dialogsConfirmed = 0;
+
         while (DateTime.UtcNow < deadline)
         {
-            // 1) Try exact titles via FindWindow
-            foreach (var pattern in titlePatterns)
+            IntPtr foundHwnd = IntPtr.Zero;
+            string foundTitle = "";
+            string foundVia = "";
+
+            // 1) Try exact title match via FindWindow for all patterns.
+            foreach (var pattern in allPatterns)
             {
                 var hWnd = FindWindow(null, pattern);
-                if (hWnd != IntPtr.Zero && IsWindowVisible(hWnd))
+                if (hWnd != IntPtr.Zero && IsWindowVisible(hWnd) && !confirmedWindows.Contains(hWnd))
                 {
-                    log("Information", $"Auto-confirm: detected dialog via exact title '{pattern}' (hWnd={hWnd}).");
-                    await TryConfirmDialog(hWnd, log, summary);
-                    return;
+                    foundHwnd = hWnd;
+                    foundTitle = pattern;
+                    foundVia = "exact title";
+                    break;
                 }
             }
 
-            // 2) Try partial title match against any visible window
-            var matched = FindWindowByPartialTitles(titlePatterns);
-            if (matched != IntPtr.Zero)
+            // 2) Try partial title match against any visible window (excluding already confirmed).
+            if (foundHwnd == IntPtr.Zero)
             {
-                var title = GetWindowTitle(matched);
-                log("Information", $"Auto-confirm: detected dialog via partial title match '{title}' (hWnd={matched}).");
-                await TryConfirmDialog(matched, log, summary);
-                return;
+                foundHwnd = FindWindowByPartialTitlesExcluding(allPatterns, confirmedWindows);
+                if (foundHwnd != IntPtr.Zero)
+                {
+                    foundTitle = GetWindowTitle(foundHwnd);
+                    foundVia = "partial title";
+                }
             }
 
-            // 3) Look for a child button with text "Run flow" inside any visible window.
-            var buttonHwnd = FindButtonWithText("Run flow");
-            if (buttonHwnd == IntPtr.Zero)
-                buttonHwnd = FindButtonWithText("Run Flow");
-            if (buttonHwnd == IntPtr.Zero)
-                buttonHwnd = FindButtonWithText("Run");
-            if (buttonHwnd == IntPtr.Zero)
-                buttonHwnd = FindButtonWithText("OK");
-
-            if (buttonHwnd != IntPtr.Zero)
+            // 3) Look for a child button ("Run flow", "Run", "OK") inside any unconfirmed visible window.
+            if (foundHwnd == IntPtr.Zero)
             {
-                var parentTitle = GetWindowTitle(GetParent(buttonHwnd));
-                log("Information", $"Auto-confirm: found button inside window '{parentTitle}' (btn hWnd={buttonHwnd}). Clicking...");
-                summary.DialogAutoConfirmed = true;
-                ClickButton(buttonHwnd);
-                log("Information", "Auto-confirm: button click sent.");
-                return;
+                var buttonHwnd = FindButtonWithTextExcluding(confirmedWindows, "Run flow");
+                if (buttonHwnd == IntPtr.Zero)
+                    buttonHwnd = FindButtonWithTextExcluding(confirmedWindows, "Run Flow");
+                if (buttonHwnd == IntPtr.Zero)
+                    buttonHwnd = FindButtonWithTextExcluding(confirmedWindows, "Run");
+                if (buttonHwnd == IntPtr.Zero)
+                    buttonHwnd = FindButtonWithTextExcluding(confirmedWindows, "OK");
+
+                if (buttonHwnd != IntPtr.Zero)
+                {
+                    var parentHwnd = GetAncestor(buttonHwnd, GA_ROOT);
+                    var parentTitle = GetWindowTitle(parentHwnd);
+                    log("Information", $"Auto-confirm: found button inside window '{parentTitle}' (btn hWnd={buttonHwnd}). Clicking...");
+                    summary.DialogAutoConfirmed = true;
+                    ClickButton(buttonHwnd);
+                    if (parentHwnd != IntPtr.Zero)
+                        confirmedWindows.Add(parentHwnd);
+                    dialogsConfirmed++;
+                    log("Information", $"Auto-confirm: dialog #{dialogsConfirmed} confirmed via button click. Continuing to watch...");
+                    await Task.Delay(1500);
+                    continue;
+                }
+            }
+
+            if (foundHwnd != IntPtr.Zero)
+            {
+                log("Information", $"Auto-confirm: detected dialog #{dialogsConfirmed + 1} via {foundVia} '{foundTitle}' (hWnd={foundHwnd}).");
+                await TryConfirmDialog(foundHwnd, log, summary);
+                confirmedWindows.Add(foundHwnd);
+                dialogsConfirmed++;
+                log("Information", $"Auto-confirm: dialog #{dialogsConfirmed} confirmed. Continuing to watch...");
+                await Task.Delay(1500);
+                continue;
             }
 
             await Task.Delay(500);
         }
 
-        var msg = "Auto-confirm: did not detect a confirmation dialog within the timeout. If a dialog appeared and was not auto-confirmed, check the visible window titles in the logs above and report the exact dialog title.";
-        log("Information", msg);
+        log("Information", $"Auto-confirm: finished. Confirmed {dialogsConfirmed} dialog(s) total.");
 
-        // Final diagnostic after timeout.
+        // Final diagnostic.
         var finalTitles = GetVisibleWindowTitles();
         if (finalTitles.Count > 0)
         {
@@ -828,10 +859,17 @@ class Program
 
     static IntPtr FindWindowByPartialTitles(IEnumerable<string> partialTitles)
     {
+        return FindWindowByPartialTitlesExcluding(partialTitles, null);
+    }
+
+    static IntPtr FindWindowByPartialTitlesExcluding(IEnumerable<string> partialTitles, HashSet<IntPtr>? exclude)
+    {
         IntPtr found = IntPtr.Zero;
         EnumWindows((hWnd, lParam) =>
         {
             if (!IsWindowVisible(hWnd))
+                return true;
+            if (exclude != null && exclude.Contains(hWnd))
                 return true;
 
             var sb = new StringBuilder(512);
@@ -879,10 +917,17 @@ class Program
 
     static IntPtr FindButtonWithText(string text)
     {
+        return FindButtonWithTextExcluding(null, text);
+    }
+
+    static IntPtr FindButtonWithTextExcluding(HashSet<IntPtr>? exclude, string text)
+    {
         IntPtr found = IntPtr.Zero;
         EnumWindows((hWnd, lParam) =>
         {
             if (!IsWindowVisible(hWnd))
+                return true;
+            if (exclude != null && exclude.Contains(hWnd))
                 return true;
 
             found = FindWindowEx(hWnd, IntPtr.Zero, "Button", text);
@@ -971,6 +1016,11 @@ class Program
 
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+
+    const int GA_ROOT = 2;
+
+    [DllImport("user32.dll")]
+    static extern IntPtr GetAncestor(IntPtr hwnd, int gaFlags);
 }
 
 public class FlowSummary
