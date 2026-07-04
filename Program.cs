@@ -205,18 +205,17 @@ class Program
 
         log("Information", $"Starting desktop flow with timeout {timeoutMinutes} minutes.");
         log("Information", $"Run URL: {runUrl}");
-        log("Information", "Note: the ms-powerautomate: URI is handed to Windows shell; the shell resolves the registered protocol handler (PAD.Console.Host.exe). The launcher process returns immediately and its exit code does not reflect the flow's actual run result.");
 
         // ------------------------------------------------------------------
-        // Launch via the Windows URI protocol handler.
-        // ms-powerautomate: is a registered protocol. It MUST be invoked with
-        // UseShellExecute = true and the URI as FileName. Passing the URI as a
-        // command-line argument to PAD.Console.Host.exe directly causes Windows
-        // to treat it as a file to open, which shows an "Open with" dialog.
+        // Launch PAD.Console.Host.exe directly with the ms-powerautomate: URI
+        // as its argument. UseShellExecute=true ensures the process starts
+        // normally (not redirected), which is required for PAD to properly
+        // handle the URI and run the flow rather than opening it in edit mode.
         // ------------------------------------------------------------------
         var psi = new ProcessStartInfo
         {
-            FileName = runUrl,
+            FileName = padPath,
+            Arguments = runUrl,
             UseShellExecute = true,
             WorkingDirectory = Path.GetDirectoryName(padPath) ?? AppContext.BaseDirectory
         };
@@ -226,18 +225,19 @@ class Program
         var started = process.Start();
         if (!started)
         {
-            logError("Failed to launch the ms-powerautomate: URI via the Windows shell. The protocol handler may not be registered.", null);
+            logError("Failed to start PAD.Console.Host.exe with the run URI.", null);
             return 1;
         }
 
-        // Give the shell a moment to start the protocol handler.
+        // Give PAD a moment to process the URI and start the flow.
         await Task.Delay(2000);
 
         var flowLabel = flowName ?? workflowId;
         summary.FlowIdentifier = flowLabel;
         summary.DispatchSucceeded = true;
+        summary.PadPath = padPath;
 
-        log("Information", $"Desktop flow '{flowLabel}' URI dispatched to Windows shell for protocol handling.");
+        log("Information", $"Desktop flow '{flowLabel}' dispatched to PAD.Console.Host.exe.");
 
         if (autoConfirmDialog)
         {
