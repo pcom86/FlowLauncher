@@ -61,16 +61,14 @@ static class DesktopFlowRunner
         log("Information", $"Starting desktop flow with timeout {timeoutMinutes} minutes.");
         log("Information", $"Run URL: {runUrl}");
 
-        var cmdLine = $"/c \"\"{padPath}\" \"{runUrl}\"\"";
-        log("Information", $"Command: cmd {cmdLine}");
-
+        // Launch the ms-powerautomate: URI directly via ShellExecute.
+        // Windows routes it to PAD's registered protocol handler, which handles
+        // all quoting internally. This avoids cmd.exe mangling the & and \"
+        // characters in the URI query string.
         var psi = new ProcessStartInfo
         {
-            FileName = "cmd.exe",
-            Arguments = cmdLine,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            WorkingDirectory = Path.GetDirectoryName(padPath) ?? AppContext.BaseDirectory
+            FileName = runUrl,
+            UseShellExecute = true
         };
 
         using var process = new Process { StartInfo = psi };
@@ -78,7 +76,7 @@ static class DesktopFlowRunner
         var started = process.Start();
         if (!started)
         {
-            logError("Failed to start PAD.Console.Host.exe with the run URI.", null);
+            logError("Failed to launch the ms-powerautomate: URI.", null);
             return 1;
         }
 
@@ -115,7 +113,7 @@ static class DesktopFlowRunner
         if (!string.IsNullOrWhiteSpace(workflowId))
             queryParts.Add($"workflowId={workflowId}");
         else
-            queryParts.Add($"workflowName={flowName}");
+            queryParts.Add($"workflowName={Uri.EscapeDataString(flowName!)}");
 
         if (!string.IsNullOrWhiteSpace(environmentId))
             queryParts.Add($"environmentid={environmentId}");
@@ -150,8 +148,8 @@ static class DesktopFlowRunner
             if (jsonObject.Count > 0)
             {
                 var inputsJson = jsonObject.ToJsonString();
-                var escapedInputs = inputsJson.Replace("\"", "\\\"");
-                queryParts.Add($"inputArguments={escapedInputs}");
+                var encodedInputs = Uri.EscapeDataString(inputsJson);
+                queryParts.Add($"inputArguments={encodedInputs}");
                 log("Information", $"Flow inputs: {inputsJson}");
             }
         }
