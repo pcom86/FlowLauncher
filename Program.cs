@@ -261,13 +261,40 @@ class Program
         var deadline = DateTime.UtcNow.AddMinutes(timeoutMinutes);
         string? runFolder = null;
 
+        // Track existing folders at start so we can detect new ones.
+        var existingFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (Directory.Exists(scriptsRoot))
+        {
+            try
+            {
+                foreach (var d in Directory.EnumerateDirectories(scriptsRoot, "*", SearchOption.AllDirectories))
+                    existingFolders.Add(d);
+            }
+            catch (IOException) { /* transient */ }
+        }
+
         while (DateTime.UtcNow < deadline && runFolder == null)
         {
             if (Directory.Exists(scriptsRoot))
             {
                 try
                 {
+                    // 1) Try exact runId match first.
                     runFolder = Directory.EnumerateDirectories(scriptsRoot, runId, SearchOption.AllDirectories).FirstOrDefault();
+
+                    // 2) If not found, look for any new folder created after we started.
+                    if (runFolder == null)
+                    {
+                        foreach (var d in Directory.EnumerateDirectories(scriptsRoot, "*", SearchOption.AllDirectories))
+                        {
+                            if (!existingFolders.Contains(d))
+                            {
+                                runFolder = d;
+                                log("Information", $"Found new run folder (not exact runId match): {runFolder}");
+                                break;
+                            }
+                        }
+                    }
                 }
                 catch (IOException) { /* transient FS race, retry */ }
             }
@@ -277,7 +304,7 @@ class Program
 
             var remaining = (deadline - DateTime.UtcNow).TotalSeconds;
             Console.Write($"\rWaiting for flow run to start... ({Math.Max(0, remaining):F0}s remaining)   ");
-            await Task.Delay(1000);
+            await Task.Delay(2000);
         }
 
         Console.WriteLine();
@@ -295,6 +322,7 @@ class Program
         var actionsLogPath = Path.Combine(runFolder, "Actions.log");
         long lastPosition = 0;
         var startTime = DateTime.UtcNow;
+        var lastLogTime = DateTime.UtcNow;
 
         while (DateTime.UtcNow < deadline)
         {
@@ -321,6 +349,7 @@ class Program
                         Console.WriteLine($"[Flow] {line}");
                         log("Information", $"[Flow Progress] {line}");
                         readAnyLine = true;
+                        lastLogTime = DateTime.UtcNow;
                     }
                     lastPosition = fs.Position;
                 }
@@ -333,10 +362,11 @@ class Program
             if (!readAnyLine)
             {
                 var elapsed = DateTime.UtcNow - startTime;
-                Console.Write($"\rFlow running... elapsed {elapsed:mm\\:ss}   ");
+                var sinceLastLog = DateTime.UtcNow - lastLogTime;
+                Console.Write($"\rFlow running... elapsed {elapsed:mm\\:ss} (last activity {sinceLastLog:ss}s ago)   ");
             }
 
-            await Task.Delay(1000);
+            await Task.Delay(2000);
         }
 
         Console.WriteLine();
