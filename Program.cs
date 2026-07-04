@@ -4,7 +4,6 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Logging;
 using Microsoft.Win32;
 
 namespace FlowLauncher;
@@ -26,14 +25,6 @@ class Program
 
         var configuration = configurationBuilder.Build();
 
-        using var loggerFactory = LoggerFactory.Create(builder =>
-        {
-            builder.AddConsole();
-            builder.SetMinimumLevel(LogLevel.Information);
-        });
-
-        var logger = loggerFactory.CreateLogger<Program>();
-
         var logPath = configuration["Logging:LogPath"];
         var fileLogger = !string.IsNullOrWhiteSpace(logPath)
             ? new FileLogger(logPath)
@@ -41,16 +32,11 @@ class Program
 
         void Log(string level, string message)
         {
-            logger.LogInformation(message);
             fileLogger?.Write(level, message);
         }
 
         void LogError(string message, Exception? ex = null)
         {
-            if (ex != null)
-                logger.LogError(ex, message);
-            else
-                logger.LogError(message);
             fileLogger?.Write("Error", message + (ex != null ? $" | Exception: {ex.Message}" : ""));
             summary.Errors.Add(message);
         }
@@ -62,10 +48,17 @@ class Program
             Log("Information", $"Base directory: {basePath}");
             Log("Information", $"Config file exists: {File.Exists(configPath)} | Path: {configPath}");
 
+            Console.WriteLine();
+            Console.WriteLine("  ╔═════════════════════════════════════════════╗");
+            Console.WriteLine("  ║              FLOW LAUNCHER                   ║");
+            Console.WriteLine("  ╚═════════════════════════════════════════════╝");
+            Console.WriteLine();
+
             var flowType = configuration["Flow:Type"]?.Trim();
             if (string.IsNullOrWhiteSpace(flowType))
             {
                 LogError("Configuration missing: Flow:Type must be set to 'Desktop' or 'Cloud'.");
+                Console.WriteLine("  ❌ Configuration missing: Flow:Type must be set to 'Desktop' or 'Cloud'.");
                 exitCode = 1;
             }
             else
@@ -81,6 +74,7 @@ class Program
                 else
                 {
                     LogError($"Unknown Flow:Type '{flowType}'. Use 'Desktop' or 'Cloud'.");
+                    Console.WriteLine($"  ❌ Unknown Flow:Type '{flowType}'. Use 'Desktop' or 'Cloud'.");
                     exitCode = 1;
                 }
             }
@@ -130,8 +124,14 @@ class Program
         if (padPath == null)
         {
             logError("PAD.Console.Host.exe not found. Install Power Automate Desktop or set Flow:PadConsoleHostPath.", null);
+            Console.WriteLine("  ❌ PAD.Console.Host.exe not found.");
             return 1;
         }
+
+        Console.WriteLine($"  📋 Flow:     {flowName ?? workflowId}");
+        Console.WriteLine($"  🔧 Type:     Desktop");
+        Console.WriteLine($"  ⏱️  Timeout:  {timeoutMinutes} min");
+        Console.WriteLine();
 
         var confirmationChanged = ConfigureExternalRunConfirmation(config, log);
         summary.ConfirmationChanged = confirmationChanged;
@@ -244,15 +244,23 @@ class Program
         summary.PadPath = padPath;
 
         log("Information", $"Desktop flow '{flowLabel}' dispatched to PAD.Console.Host.exe.");
+        Console.WriteLine("  🚀 Flow dispatched to Power Automate Desktop");
+        Console.WriteLine();
 
+        // Auto-confirm runs in parallel — it only logs to file, not console,
+        // to avoid interleaving with the progress display.
+        Task? autoConfirmTask = null;
         if (autoConfirmDialog)
         {
-            // Launch in parallel so it doesn't block progress display.
-            _ = Task.Run(async () => await AutoConfirmRunFlowDialog(60, log, summary));
+            autoConfirmTask = Task.Run(async () => await AutoConfirmRunFlowDialog(60, log, summary));
         }
 
         if (showProgress)
             await ShowDesktopFlowProgress(runId!, progressTimeoutMinutes, log, summary);
+
+        // Wait for auto-confirm to finish before returning.
+        if (autoConfirmTask != null)
+            await autoConfirmTask;
 
         return 0;
     }
@@ -365,11 +373,18 @@ class Program
                     {
                         if (string.IsNullOrWhiteSpace(line))
                             continue;
+
+                        log("Information", $"[Flow Progress] {line}");
+
+                        // Try to extract a clean action name from the log line.
+                        var display = ExtractActionName(line);
+                        if (display == null)
+                            continue; // Skip noise lines that aren't actual actions.
+
                         stepCount++;
                         var time = DateTime.Now.ToString("HH:mm:ss");
-                        var display = line.Length > 43 ? line[..40] + "..." : line;
-                        Console.WriteLine($"  │ #{stepCount,3} │ {time} │ {display}");
-                        log("Information", $"[Flow Progress] {line}");
+                        var truncated = display.Length > 38 ? display[..35] + "..." : display;
+                        Console.WriteLine($"  │ #{stepCount,3} │ {time} │ {truncated}");
                         readAnyLine = true;
                         lastLogTime = DateTime.UtcNow;
                     }
@@ -394,6 +409,45 @@ class Program
         Console.WriteLine($"  ⚠️  {timeoutMsg}");
         log("Warning", timeoutMsg);
         summary.Warnings.Add(timeoutMsg);
+    }
+
+    static string? ExtractActionName(string line)
+    {
+        var trimmed = line.Trim();
+        if (string.IsNullOrEmpty(trimmed))
+            return null;
+
+        // Try JSON parsing — PAD logs may be JSON with action name fields.
+        if (trimmed.StartsWith('{'))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(trimmed);
+                var root = doc.RootElement;
+
+                foreach (var field in new[] { "actionName", "ActionName", "name", "Name", "action", "Action", "description", "Description", "message", "Message" })
+                {
+                    if (root.TryGetProperty(field, out var prop) && prop.ValueKind == JsonValueKind.String)
+                    {
+                        var val = prop.GetString();
+                        if (!string.IsNullOrWhiteSpace(val))
+                            return val;
+                    }
+                }
+                return null;
+            }
+            catch (JsonException) { /* not valid JSON, fall through */ }
+        }
+
+        // Plain text line — filter out obvious noise.
+        var lower = trimmed.ToLowerInvariant();
+        if (lower.StartsWith("log ") || lower.StartsWith("timestamp:") ||
+            lower.StartsWith("run id:") || lower.StartsWith("flow id:") ||
+            lower.StartsWith("machine:") || lower.StartsWith("user:") ||
+            lower.StartsWith("---") || lower.StartsWith("==="))
+            return null;
+
+        return trimmed;
     }
 
     static string? ResolvePadConsoleHostPath(IConfiguration config, Action<string, string> log)
