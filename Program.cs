@@ -12,6 +12,8 @@ class Program
 {
     static async Task<int> Main(string[] args)
     {
+        var summary = new FlowSummary();
+
         var basePath = AppContext.BaseDirectory;
         var configPath = Path.Combine(basePath, "appsettings.json");
 
@@ -49,8 +51,10 @@ class Program
             else
                 logger.LogError(message);
             fileLogger?.Write("Error", message + (ex != null ? $" | Exception: {ex.Message}" : ""));
+            summary.Errors.Add(message);
         }
 
+        int exitCode = 1;
         try
         {
             Log("Information", $"FlowLauncher started at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
@@ -61,32 +65,42 @@ class Program
             if (string.IsNullOrWhiteSpace(flowType))
             {
                 LogError("Configuration missing: Flow:Type must be set to 'Desktop' or 'Cloud'.");
-                return 1;
+                exitCode = 1;
             }
+            else
+            {
+                flowType = flowType.ToLowerInvariant();
+                summary.FlowType = flowType;
+                Log("Information", $"Flow type: {flowType}");
 
-            flowType = flowType.ToLowerInvariant();
-            Log("Information", $"Flow type: {flowType}");
-
-            if (flowType == "desktop")
-                return await RunDesktopFlow(configuration, Log, LogError);
-            if (flowType == "cloud")
-                return await RunCloudFlow(configuration, Log, LogError);
-
-            LogError($"Unknown Flow:Type '{flowType}'. Use 'Desktop' or 'Cloud'.");
-            return 1;
+                if (flowType == "desktop")
+                    exitCode = await RunDesktopFlow(configuration, Log, LogError, summary);
+                else if (flowType == "cloud")
+                    exitCode = await RunCloudFlow(configuration, Log, LogError, summary);
+                else
+                {
+                    LogError($"Unknown Flow:Type '{flowType}'. Use 'Desktop' or 'Cloud'.");
+                    exitCode = 1;
+                }
+            }
         }
         catch (Exception ex)
         {
             LogError("Unhandled exception occurred.", ex);
-            return 1;
+            exitCode = 1;
         }
         finally
         {
+            summary.ExitCode = exitCode;
+            summary.EndTime = DateTime.Now;
+            summary.Print();
             fileLogger?.Dispose();
         }
+
+        return exitCode;
     }
 
-    static async Task<int> RunDesktopFlow(IConfiguration config, Action<string, string> log, Action<string, Exception?> logError)
+    static async Task<int> RunDesktopFlow(IConfiguration config, Action<string, string> log, Action<string, Exception?> logError, FlowSummary summary)
     {
         var flowName = config["Flow:Name"];
         var workflowId = config["Flow:WorkflowId"];
@@ -100,6 +114,9 @@ class Program
 
         if (string.IsNullOrWhiteSpace(runId))
             runId = Guid.NewGuid().ToString();
+
+        summary.RunId = runId;
+        summary.ProgressTimeoutMinutes = progressTimeoutMinutes;
 
         if (string.IsNullOrWhiteSpace(flowName) && string.IsNullOrWhiteSpace(workflowId))
         {
@@ -115,11 +132,14 @@ class Program
         }
 
         var confirmationChanged = ConfigureExternalRunConfirmation(config, log);
+        summary.ConfirmationChanged = confirmationChanged;
+        summary.PadRestarted = forceRestartPad;
 
         if (confirmationChanged || forceRestartPad)
             EnsurePadRestarted(forceRestartPad, log);
 
         log("Information", $"PAD console host path: {padPath}");
+        summary.PadPath = padPath;
 
         // PAD.Console.Host.exe is invoked with a single ms-powerautomate: run URL,
         // NOT with custom flags like -run/-inputs. See:
@@ -208,11 +228,17 @@ class Program
         if (!string.IsNullOrWhiteSpace(output))
             log("Information", $"PAD stdout: {output}");
         if (!string.IsNullOrWhiteSpace(error))
+        {
             log("Warning", $"PAD stderr: {error}");
+            summary.Warnings.Add($"PAD stderr: {error}");
+        }
 
         log("Information", $"PAD exit code: {process.ExitCode}");
 
         var flowLabel = flowName ?? workflowId;
+        summary.FlowIdentifier = flowLabel;
+        summary.PadExitCode = process.ExitCode;
+        summary.DispatchSucceeded = process.ExitCode == 0;
 
         if (process.ExitCode != 0)
         {
@@ -223,12 +249,12 @@ class Program
         log("Information", $"Desktop flow '{flowLabel}' dispatched successfully to Power Automate.");
 
         if (showProgress)
-            await ShowDesktopFlowProgress(runId!, progressTimeoutMinutes, log);
+            await ShowDesktopFlowProgress(runId!, progressTimeoutMinutes, log, summary);
 
         return 0;
     }
 
-    static async Task ShowDesktopFlowProgress(string runId, int timeoutMinutes, Action<string, string> log)
+    static async Task ShowDesktopFlowProgress(string runId, int timeoutMinutes, Action<string, string> log, FlowSummary summary)
     {
         var scriptsRoot = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -262,11 +288,14 @@ class Program
 
         if (runFolder == null)
         {
-            log("Warning", "Could not locate the run log folder within the timeout window; progress display unavailable. The flow may still be running in the background.");
+            var msg = "Could not locate the run log folder within the timeout window; progress display unavailable. The flow may still be running in the background.";
+            log("Warning", msg);
+            summary.Warnings.Add(msg);
             return;
         }
 
         log("Information", $"Run folder detected: {runFolder}");
+        summary.RunFolderPath = runFolder;
         var actionsLogPath = Path.Combine(runFolder, "Actions.log");
         long lastPosition = 0;
         var startTime = DateTime.UtcNow;
@@ -315,7 +344,9 @@ class Program
         }
 
         Console.WriteLine();
-        log("Warning", $"Timed out after {timeoutMinutes} minutes waiting for the desktop flow run to finish. It may still be running.");
+        var timeoutMsg = $"Timed out after {timeoutMinutes} minutes waiting for the desktop flow run to finish. It may still be running.";
+        log("Warning", timeoutMsg);
+        summary.Warnings.Add(timeoutMsg);
     }
 
     static string? ResolvePadConsoleHostPath(IConfiguration config, Action<string, string> log)
@@ -463,10 +494,11 @@ class Program
         log("Information", "PAD processes terminated. Proceeding with flow dispatch.");
     }
 
-    static async Task<int> RunCloudFlow(IConfiguration config, Action<string, string> log, Action<string, Exception?> logError)
+    static async Task<int> RunCloudFlow(IConfiguration config, Action<string, string> log, Action<string, Exception?> logError, FlowSummary summary)
     {
         var triggerUrl = config["Flow:HttpTriggerUrl"];
         var timeoutMinutes = config.GetValue<int?>("Flow:TimeoutMinutes") ?? 5;
+        summary.TriggerUrl = triggerUrl;
 
         if (string.IsNullOrWhiteSpace(triggerUrl))
         {
@@ -522,11 +554,13 @@ class Program
             }
 
             log("Information", "Cloud flow triggered successfully.");
+            summary.HttpStatusCode = (int)response.StatusCode;
+            summary.HasAsyncPolling = response.StatusCode == System.Net.HttpStatusCode.Accepted && response.Headers.Location != null;
 
             var showProgress = config.GetValue<bool?>("Flow:ShowProgress") ?? true;
             if (showProgress && response.StatusCode == System.Net.HttpStatusCode.Accepted && response.Headers.Location != null)
             {
-                await PollCloudFlowStatus(response.Headers.Location.ToString(), timeoutMinutes, log);
+                await PollCloudFlowStatus(response.Headers.Location.ToString(), timeoutMinutes, log, summary);
             }
             else if (showProgress)
             {
@@ -547,7 +581,7 @@ class Program
         }
     }
 
-    static async Task PollCloudFlowStatus(string statusUrl, int timeoutMinutes, Action<string, string> log)
+    static async Task PollCloudFlowStatus(string statusUrl, int timeoutMinutes, Action<string, string> log, FlowSummary summary)
     {
         using var client = new HttpClient();
         var deadline = DateTime.UtcNow.AddMinutes(timeoutMinutes);
@@ -592,19 +626,106 @@ class Program
                 {
                     Console.WriteLine();
                     log("Information", $"Cloud flow reached terminal state: {status}");
+                    summary.FinalAsyncStatus = status;
                     return;
                 }
             }
             catch (HttpRequestException ex)
             {
-                log("Warning", $"Error while polling flow status (will retry): {ex.Message}");
+                var msg = $"Error while polling flow status (will retry): {ex.Message}";
+                log("Warning", msg);
+                summary.Warnings.Add(msg);
             }
 
             await Task.Delay(2000);
         }
 
         Console.WriteLine();
-        log("Warning", $"Timed out after {timeoutMinutes} minutes waiting for the cloud flow to reach a terminal state.");
+        var timeoutMsg = $"Timed out after {timeoutMinutes} minutes waiting for the cloud flow to reach a terminal state.";
+        log("Warning", timeoutMsg);
+        summary.Warnings.Add(timeoutMsg);
+    }
+}
+
+public class FlowSummary
+{
+    public DateTime StartTime { get; } = DateTime.Now;
+    public DateTime? EndTime { get; set; }
+    public string? FlowType { get; set; }
+    public string? FlowIdentifier { get; set; }
+    public int ExitCode { get; set; }
+
+    public string? PadPath { get; set; }
+    public string? RunId { get; set; }
+    public int? PadExitCode { get; set; }
+    public bool DispatchSucceeded { get; set; }
+    public bool ConfirmationChanged { get; set; }
+    public bool PadRestarted { get; set; }
+    public string? RunFolderPath { get; set; }
+    public int? ProgressTimeoutMinutes { get; set; }
+
+    public int? HttpStatusCode { get; set; }
+    public string? FinalAsyncStatus { get; set; }
+    public string? TriggerUrl { get; set; }
+    public bool HasAsyncPolling { get; set; }
+
+    public List<string> Errors { get; } = new();
+    public List<string> Warnings { get; } = new();
+
+    public TimeSpan Duration => EndTime.HasValue ? EndTime.Value - StartTime : DateTime.Now - StartTime;
+
+    public void Print()
+    {
+        Console.WriteLine();
+        Console.WriteLine(new string('=', 70));
+        Console.WriteLine("  FLOW EXECUTION SUMMARY");
+        Console.WriteLine(new string('=', 70));
+        Console.WriteLine($"  Flow Type:        {FlowType ?? "Unknown"}");
+        Console.WriteLine($"  Flow Identifier:  {FlowIdentifier ?? "N/A"}");
+        Console.WriteLine($"  Start Time:       {StartTime:yyyy-MM-dd HH:mm:ss}");
+        Console.WriteLine($"  End Time:         {(EndTime.HasValue ? EndTime.Value.ToString("yyyy-MM-dd HH:mm:ss") : "N/A")}");
+        Console.WriteLine($"  Duration:         {Duration:hh\\:mm\\:ss}");
+        Console.WriteLine($"  Overall Result:   {(ExitCode == 0 ? "SUCCESS" : "FAILED")} (Exit Code: {ExitCode})");
+        Console.WriteLine(new string('-', 70));
+
+        if (FlowType?.Equals("desktop", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            Console.WriteLine($"  PAD Path:         {PadPath ?? "N/A"}");
+            Console.WriteLine($"  Run ID:           {RunId ?? "N/A"}");
+            Console.WriteLine($"  PAD Exit Code:    {PadExitCode?.ToString() ?? "N/A"}");
+            Console.WriteLine($"  Dispatch Status:  {(DispatchSucceeded ? "Dispatched" : "Failed")}");
+            Console.WriteLine($"  Confirmation:     {(ConfirmationChanged ? "Disabled (registry changed)" : "Unchanged")}");
+            Console.WriteLine($"  PAD Restarted:    {(PadRestarted ? "Yes" : "No")}");
+            if (!string.IsNullOrWhiteSpace(RunFolderPath))
+                Console.WriteLine($"  Run Log Folder:   {RunFolderPath}");
+        }
+        else if (FlowType?.Equals("cloud", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            Console.WriteLine($"  Trigger URL:      {TriggerUrl ?? "N/A"}");
+            Console.WriteLine($"  HTTP Status:      {HttpStatusCode?.ToString() ?? "N/A"}");
+            Console.WriteLine($"  Async Polling:    {(HasAsyncPolling ? "Yes" : "No")}");
+            if (!string.IsNullOrWhiteSpace(FinalAsyncStatus))
+                Console.WriteLine($"  Final Status:     {FinalAsyncStatus}");
+        }
+
+        if (Errors.Count > 0)
+        {
+            Console.WriteLine(new string('-', 70));
+            Console.WriteLine($"  ERRORS ({Errors.Count}):");
+            foreach (var error in Errors)
+                Console.WriteLine($"    - {error}");
+        }
+
+        if (Warnings.Count > 0)
+        {
+            Console.WriteLine(new string('-', 70));
+            Console.WriteLine($"  WARNINGS ({Warnings.Count}):");
+            foreach (var warning in Warnings)
+                Console.WriteLine($"    - {warning}");
+        }
+
+        Console.WriteLine(new string('=', 70));
+        Console.WriteLine();
     }
 }
 
