@@ -1,0 +1,15 @@
+## .NET build artifacts
+bin/
+obj/
+
+## Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+
+## Logs
+*.log
+
+## Local test/override configs (avoid committing secrets)
+appsettings.*.local.json
