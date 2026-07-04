@@ -182,6 +182,54 @@ To handle this, FlowLauncher includes a **UI automation fallback** (enabled by d
 > [!NOTE]
 > This fallback requires the FlowLauncher process to be running on the **interactive desktop session** (i.e., a logged-in user session with a visible desktop). It does **not** work in a non-interactive session (e.g., a Windows service or Task Scheduler running as SYSTEM without "Run only when user is logged on"). Set `AutoConfirmDialog: false` to disable this behavior if you do not want FlowLauncher to interact with the UI.
 
+## Passing Input Variables to Desktop Flows
+
+Use the `Flow:Inputs` section in `appsettings.json` to pass input variables to your Power Automate Desktop flow. This prevents PAD from showing an input dialog and asking for values interactively.
+
+### Example
+
+```json
+{
+  "Flow": {
+    "Inputs": {
+      "CustomerName": "Acme Corp",
+      "OrderId": 12345,
+      "IsPriority": true,
+      "Config": "{\"Department\":\"Sales\"}"
+    }
+  }
+}
+```
+
+### How it works
+
+FlowLauncher reads each key-value pair from `Flow:Inputs` and passes them to PAD via the `inputArguments` query parameter in the `ms-powerautomate:` run URL. The values are automatically typed:
+
+| Config Value | Becomes in JSON | PAD Variable Type |
+|---|---|---|
+| `"hello"` | `"hello"` (string) | Text |
+| `12345` | `12345` (number) | Number |
+| `true` / `false` | `true` / `false` (boolean) | Boolean |
+| `"{\"key\":\"val\"}"` | `{"key":"val"}` (object) | Custom Object |
+
+### Requirements for this to work
+
+1. **The flow must define input variables** — In PAD, open your flow, go to **Variables**, and create variables with the **Input** direction. The variable names must match the keys in `Flow:Inputs` exactly (case-insensitive in PAD but case-sensitive in URL).
+
+2. **Do NOT use "Display input dialog" actions** — If your flow contains an action that explicitly asks the user for input (e.g., "Display input dialog" or "Ask for text"), PAD will still show a dialog regardless of `inputArguments`. Remove such actions and use input variables instead.
+
+3. **PAD Console Host must support inputArguments** — This is supported in PAD 2.14+. If you are on an older version, inputs will be ignored and PAD may show a dialog.
+
+### Passing complex values
+
+For objects and arrays, write the JSON directly as a **string** in the config file:
+
+```json
+"Config": "{\"Department\":\"Sales\",\"Region\":\"EMEA\"}"
+```
+
+This is serialized into the URL as a proper JSON object that PAD can map to a custom object variable.
+
 ## Live Progress Display
 
 When `Flow:ShowProgress` is `true` (default):

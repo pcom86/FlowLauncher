@@ -156,14 +156,44 @@ class Program
         if (!string.IsNullOrWhiteSpace(environmentId))
             queryParts.Add($"environmentid={environmentId}");
 
-        var inputs = config.GetSection("Flow:Inputs").Get<Dictionary<string, object?>>();
-        if (inputs != null && inputs.Count > 0)
+        var inputEntries = config.GetSection("Flow:Inputs").GetChildren().ToList();
+        if (inputEntries.Count > 0)
         {
-            var inputsJson = JsonSerializer.Serialize(inputs);
-            // The run URL requires the JSON to have its double quotes backslash-escaped.
-            var escapedInputs = inputsJson.Replace("\"", "\\\"");
-            queryParts.Add($"inputArguments={escapedInputs}");
-            log("Information", $"Flow inputs: {inputsJson}");
+            var jsonObject = new System.Text.Json.Nodes.JsonObject();
+            foreach (var entry in inputEntries)
+            {
+                if (string.IsNullOrWhiteSpace(entry.Value))
+                    continue;
+
+                var raw = entry.Value.Trim();
+
+                // Explicitly handle C#-style booleans before trying JSON parse.
+                if (bool.TryParse(raw, out var boolValue))
+                {
+                    jsonObject[entry.Key] = boolValue;
+                    continue;
+                }
+
+                try
+                {
+                    // Try to parse as a JSON literal (number, null, object, array).
+                    jsonObject[entry.Key] = System.Text.Json.Nodes.JsonNode.Parse(raw);
+                }
+                catch
+                {
+                    // If it isn't valid JSON (e.g. a plain string like "hello"),
+                    // treat it as a JSON string value.
+                    jsonObject[entry.Key] = raw;
+                }
+            }
+
+            if (jsonObject.Count > 0)
+            {
+                var inputsJson = jsonObject.ToJsonString();
+                var escapedInputs = Uri.EscapeDataString(inputsJson);
+                queryParts.Add($"inputArguments={escapedInputs}");
+                log("Information", $"Flow inputs: {inputsJson}");
+            }
         }
 
         if (autoLogin)
