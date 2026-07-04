@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Configuration;
@@ -111,6 +112,7 @@ class Program
         var showProgress = config.GetValue<bool?>("Flow:ShowProgress") ?? true;
         var progressTimeoutMinutes = config.GetValue<int?>("Flow:ProgressTimeoutMinutes") ?? timeoutMinutes;
         var forceRestartPad = config.GetValue<bool?>("Flow:ForceRestartPad") ?? false;
+        var autoConfirmDialog = config.GetValue<bool?>("Flow:AutoConfirmDialog") ?? true;
 
         if (string.IsNullOrWhiteSpace(runId))
             runId = Guid.NewGuid().ToString();
@@ -247,6 +249,12 @@ class Program
         }
 
         log("Information", $"Desktop flow '{flowLabel}' dispatched successfully to Power Automate.");
+
+        if (autoConfirmDialog)
+        {
+            // Launch in parallel so it doesn't block progress display.
+            _ = Task.Run(async () => await AutoConfirmRunFlowDialog(30, log, summary));
+        }
 
         if (showProgress)
             await ShowDesktopFlowProgress(runId!, progressTimeoutMinutes, log, summary);
@@ -645,6 +653,87 @@ class Program
         log("Warning", timeoutMsg);
         summary.Warnings.Add(timeoutMsg);
     }
+
+    // ------------------------------------------------------------------
+    // UI-Automation fallback: auto-confirm the "Run flow" dialog window
+    // that PAD shows when the registry override is not honored (e.g.
+    // newer PAD versions with the Connections dialog, or admin policies).
+    // ------------------------------------------------------------------
+
+    static async Task AutoConfirmRunFlowDialog(int timeoutSeconds, Action<string, string> log, FlowSummary summary)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+        log("Information", $"Auto-confirm fallback active: watching for 'Run flow' dialog (up to {timeoutSeconds}s).");
+
+        while (DateTime.UtcNow < deadline)
+        {
+            // Try exact title first, then partial match.
+            var hWnd = FindWindow(null, "Run flow");
+            if (hWnd == IntPtr.Zero)
+            {
+                // Some localized or variant titles contain "Run flow"
+                hWnd = FindWindowByPartialTitle("Run flow");
+            }
+
+            if (hWnd != IntPtr.Zero)
+            {
+                log("Information", "Auto-confirm: detected 'Run flow' dialog. Sending Enter key...");
+                summary.DialogAutoConfirmed = true;
+
+                SetForegroundWindow(hWnd);
+                await Task.Delay(200); // let the window activate
+
+                // Send Enter (VK_RETURN = 0x0D)
+                keybd_event(0x0D, 0, 0, UIntPtr.Zero);               // KEYDOWN
+                keybd_event(0x0D, 0, KEYEVENTF_KEYUP, UIntPtr.Zero); // KEYUP
+
+                log("Information", "Auto-confirm: Enter key sent to dialog.");
+                return;
+            }
+
+            await Task.Delay(500);
+        }
+
+        var msg = "Auto-confirm: did not detect a 'Run flow' dialog within the timeout. If the dialog appeared and was not auto-confirmed, you may need to adjust the dialog title or use a different workaround.";
+        log("Information", msg);
+    }
+
+    static IntPtr FindWindowByPartialTitle(string partialTitle)
+    {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows((hWnd, lParam) =>
+        {
+            var sb = new StringBuilder(256);
+            GetWindowText(hWnd, sb, sb.Capacity);
+            if (sb.ToString().Contains(partialTitle, StringComparison.OrdinalIgnoreCase))
+            {
+                found = hWnd;
+                return false; // stop enumeration
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    // P/Invoke declarations
+    const uint KEYEVENTF_KEYUP = 0x0002;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern IntPtr FindWindow(string? lpClassName, string? lpWindowName);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+    [DllImport("user32.dll")]
+    static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 }
 
 public class FlowSummary
@@ -663,6 +752,7 @@ public class FlowSummary
     public bool PadRestarted { get; set; }
     public string? RunFolderPath { get; set; }
     public int? ProgressTimeoutMinutes { get; set; }
+    public bool DialogAutoConfirmed { get; set; }
 
     public int? HttpStatusCode { get; set; }
     public string? FinalAsyncStatus { get; set; }
@@ -696,6 +786,7 @@ public class FlowSummary
             Console.WriteLine($"  Dispatch Status:  {(DispatchSucceeded ? "Dispatched" : "Failed")}");
             Console.WriteLine($"  Confirmation:     {(ConfirmationChanged ? "Disabled (registry changed)" : "Unchanged")}");
             Console.WriteLine($"  PAD Restarted:    {(PadRestarted ? "Yes" : "No")}");
+            Console.WriteLine($"  Dialog Confirmed: {(DialogAutoConfirmed ? "Yes (auto-clicked)" : "No")}");
             if (!string.IsNullOrWhiteSpace(RunFolderPath))
                 Console.WriteLine($"  Run Log Folder:   {RunFolderPath}");
         }

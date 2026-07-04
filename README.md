@@ -125,6 +125,8 @@ If you prefer to deploy manually:
 | `Flow:AutoLogin` | Sign in silently with current Windows account | No (default: false) |
 | `Flow:RunId` | GUID used to name the on-disk run log folder | No |
 | `Flow:DisableExternalConfirmation` | Suppress the "An external process is trying to start the flow" dialog | No (default: false) |
+| `Flow:ForceRestartPad` | Terminate running PAD processes so registry changes take effect | No (default: false) |
+| `Flow:AutoConfirmDialog` | Auto-click the PAD confirmation dialog if it still appears | No (default: true) |
 | `Flow:PadConsoleHostPath` | Full path to `PAD.Console.Host.exe`; leave empty to auto-detect | No |
 | `Flow:TimeoutMinutes` | Max wait time before abort | No (default: 30 Desktop / 5 Cloud) |
 | `Flow:ShowProgress` | Display live flow progress on the console | No (default: true) |
@@ -166,6 +168,19 @@ FlowLauncher handles this automatically:
 **Important constraints**:
 - **Admin policy overrides this.** If your Power Platform admin has set `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Power Automate Desktop\ConfigureExternalRuns` to `1` (dialog enforced) or `2` (external runs blocked entirely), FlowLauncher cannot override it — it will log a warning and leave the setting untouched.
 - **Licensing**: some community reports indicate the underlying console setting is only exposed with a Premium/Process license; without one, the dialog may still require manual confirmation for **unattended** runs regardless of this registry value, since unattended execution itself requires an unattended RDP session/Process license. See [Power Automate pricing](https://www.microsoft.com/power-platform/products/power-automate/pricing).
+
+### Step 3: Auto-confirm fallback (UI automation)
+
+Even with the registry setting disabled and PAD restarted, newer PAD versions (2.42+) introduced a **separate "Run flow" dialog** that appears when flows use cloud connectors. This dialog is **NOT** controlled by the `EnableAskBeforeRunningAFlowExternally` registry key.
+
+To handle this, FlowLauncher includes a **UI automation fallback** (enabled by default via `Flow:AutoConfirmDialog: true`):
+
+1. After dispatching the flow, FlowLauncher watches for a top-level window with the title **"Run flow"**.
+2. If the dialog appears within 30 seconds, FlowLauncher automatically brings it to the foreground and sends the **Enter** key to confirm it.
+3. This works for both the external-invocation confirmation and the newer connections dialog.
+
+> [!NOTE]
+> This fallback requires the FlowLauncher process to be running on the **interactive desktop session** (i.e., a logged-in user session with a visible desktop). It does **not** work in a non-interactive session (e.g., a Windows service or Task Scheduler running as SYSTEM without "Run only when user is logged on"). Set `AutoConfirmDialog: false` to disable this behavior if you do not want FlowLauncher to interact with the UI.
 
 ## Live Progress Display
 
