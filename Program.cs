@@ -654,6 +654,19 @@ class Program
         var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
         log("Information", $"Auto-confirm fallback active: watching for confirmation dialog (up to {timeoutSeconds}s).");
 
+        // ------------------------------------------------------------------
+        // Step 0: Wait for PAD.Console.Host.exe to actually start.
+        // When launching via shell/protocol, there can be a 1-3s delay
+        // before PAD spawns. Looking for the dialog before PAD exists
+        // wastes part of our timeout budget.
+        // ------------------------------------------------------------------
+        var padStarted = await WaitForPadProcess(15, log);
+        if (!padStarted)
+        {
+            log("Warning", "Auto-confirm: PAD.Console.Host.exe did not appear within 15 seconds. The ms-powerautomate: protocol may not be registered, or PAD is not installed.");
+            return;
+        }
+
         // Diagnostic: list visible top-level windows (helps us tune title matching).
         var debugTitles = GetVisibleWindowTitles();
         if (debugTitles.Count > 0)
@@ -662,14 +675,13 @@ class Program
         }
 
         // PAD confirmation dialogs use a variety of titles.
-        // We search in priority order.
         var titlePatterns = new[]
         {
-            "Run flow",                                            // PAD 2.42+ connections dialog
-            "Run Flow",                                            // variant capitalisation
-            "Power Automate",                                      // generic PAD window
+            "Run flow",
+            "Run Flow",
+            "Power Automate",
             "Microsoft Power Automate",
-            "An external source is attempting to run",              // the dialog the user is seeing
+            "An external source is attempting to run",
             "An external process",
             "External Process",
             "external source",
@@ -703,7 +715,6 @@ class Program
             }
 
             // 3) Look for a child button with text "Run flow" inside any visible window.
-            // This catches dialogs where the *button* says "Run flow" but the window title is generic.
             var buttonHwnd = FindButtonWithText("Run flow");
             if (buttonHwnd == IntPtr.Zero)
                 buttonHwnd = FindButtonWithText("Run Flow");
@@ -736,28 +747,79 @@ class Program
         }
     }
 
+    static async Task<bool> WaitForPadProcess(int maxSeconds, Action<string, string> log)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(maxSeconds);
+        var padNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "PAD.Console.Host",
+            "PAD.Designer",
+            "PowerAutomateDesktop",
+            "PowerAutomateDesktop.Console"
+        };
+
+        while (DateTime.UtcNow < deadline)
+        {
+            var anyPad = Process.GetProcesses().Any(p =>
+            {
+                try { return padNames.Contains(p.ProcessName); }
+                catch { return false; }
+            });
+
+            if (anyPad)
+                return true;
+
+            await Task.Delay(500);
+        }
+        return false;
+    }
+
     static async Task TryConfirmDialog(IntPtr hWnd, Action<string, string> log, FlowSummary summary)
     {
         summary.DialogAutoConfirmed = true;
 
+        // Aggressively bring the dialog to the absolute foreground.
+        ShowWindow(hWnd, SW_RESTORE);
+        await Task.Delay(100);
+        SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        await Task.Delay(100);
         SetForegroundWindow(hWnd);
         await Task.Delay(300);
 
-        // Method A: Send Enter key (works for most confirmation dialogs)
-        keybd_event(0x0D, 0, 0, UIntPtr.Zero);               // KEYDOWN
-        keybd_event(0x0D, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);   // KEYUP
-        log("Information", "Auto-confirm: Enter key sent to dialog.");
-
+        // Method A: Send Enter key via keybd_event to the foreground window.
+        log("Information", "Auto-confirm: sending Enter key via keybd_event...");
+        SendKey(VK_RETURN);
+        await Task.Delay(400);
+        SendKey(VK_RETURN); // second press for safety
         await Task.Delay(200);
 
-        // Method B: If the dialog is still visible, try sending Enter via PostMessage
-        // (directly to the window message queue, works even if foregrounding failed).
+        // Method B: Post WM_KEYDOWN/KEYUP directly to the dialog.
         if (IsWindow(hWnd))
         {
             PostMessage(hWnd, WM_KEYDOWN, (IntPtr)VK_RETURN, IntPtr.Zero);
             PostMessage(hWnd, WM_KEYUP, (IntPtr)VK_RETURN, IntPtr.Zero);
             log("Information", "Auto-confirm: WM_KEYDOWN/KEYUP posted to dialog.");
         }
+
+        // Method C: If the dialog is still visible, try Tab then Enter
+        // (in case focus is not on the primary button).
+        await Task.Delay(300);
+        if (IsWindowVisible(hWnd))
+        {
+            SendKey(VK_TAB);
+            await Task.Delay(200);
+            SendKey(VK_RETURN);
+            log("Information", "Auto-confirm: Tab+Enter sent as fallback.");
+        }
+
+        // Remove topmost status so the window doesn't stay pinned.
+        SetWindowPos(hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    }
+
+    static void SendKey(int vk)
+    {
+        keybd_event((byte)vk, 0, 0, UIntPtr.Zero);
+        keybd_event((byte)vk, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
     }
 
     // ------------------------------------------------------------------
@@ -826,7 +888,6 @@ class Program
             found = FindWindowEx(hWnd, IntPtr.Zero, "Button", text);
             if (found == IntPtr.Zero)
             {
-                // Try partial button text match via EnumChildWindows
                 var target = text;
                 EnumChildWindows(hWnd, (child, _) =>
                 {
@@ -841,14 +902,13 @@ class Program
                 }, IntPtr.Zero);
             }
 
-            return found == IntPtr.Zero; // stop top-level enum if we found the button
+            return found == IntPtr.Zero;
         }, IntPtr.Zero);
         return found;
     }
 
     static void ClickButton(IntPtr hWnd)
     {
-        // Send BM_CLICK to simulate a button click
         SendMessage(hWnd, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
     }
 
@@ -859,13 +919,26 @@ class Program
     const int WM_KEYDOWN = 0x0100;
     const int WM_KEYUP = 0x0101;
     const int VK_RETURN = 0x0D;
+    const int VK_TAB = 0x09;
     const int BM_CLICK = 0x00F5;
+    const int SW_RESTORE = 9;
+    static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
+    const uint SWP_NOMOVE = 0x0002;
+    const uint SWP_NOSIZE = 0x0001;
+    const uint SWP_SHOWWINDOW = 0x0040;
 
     [DllImport("user32.dll", SetLastError = true)]
     static extern IntPtr FindWindow(string? lpClassName, string? lpWindowName);
 
     [DllImport("user32.dll", SetLastError = true)]
     static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
     [DllImport("user32.dll")]
     static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
