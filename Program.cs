@@ -706,12 +706,15 @@ class Program
         // We search in priority order.
         var titlePatterns = new[]
         {
-            "Run flow",        // PAD 2.42+ connections dialog
-            "Run Flow",        // variant capitalisation
-            "Power Automate",  // generic PAD window
+            "Run flow",                                            // PAD 2.42+ connections dialog
+            "Run Flow",                                            // variant capitalisation
+            "Power Automate",                                      // generic PAD window
             "Microsoft Power Automate",
+            "An external source is attempting to run",              // the dialog the user is seeing
             "An external process",
             "External Process",
+            "external source",
+            "attempting to run",
             "Confirm",
             "Confirm Action"
         };
