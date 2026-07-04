@@ -242,7 +242,7 @@ class Program
         if (autoConfirmDialog)
         {
             // Launch in parallel so it doesn't block progress display.
-            _ = Task.Run(async () => await AutoConfirmRunFlowDialog(30, log, summary));
+            _ = Task.Run(async () => await AutoConfirmRunFlowDialog(60, log, summary));
         }
 
         if (showProgress)
@@ -687,7 +687,15 @@ class Program
             "Run flow",
             "Run Flow",
             "Power Automate",
-            "Microsoft Power Automate"
+            "Microsoft Power Automate",
+            "Input",
+            "Inputs",
+            "Enter values",
+            "Enter Values",
+            "Parameters",
+            "Variables",
+            "Set variables",
+            "Flow inputs"
         };
 
         // All patterns combined for broad matching.
