@@ -693,60 +693,211 @@ class Program
     static async Task AutoConfirmRunFlowDialog(int timeoutSeconds, Action<string, string> log, FlowSummary summary)
     {
         var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
-        log("Information", $"Auto-confirm fallback active: watching for 'Run flow' dialog (up to {timeoutSeconds}s).");
+        log("Information", $"Auto-confirm fallback active: watching for confirmation dialog (up to {timeoutSeconds}s).");
+
+        // Diagnostic: list visible top-level windows (helps us tune title matching).
+        var debugTitles = GetVisibleWindowTitles();
+        if (debugTitles.Count > 0)
+        {
+            log("Information", "Visible top-level windows at start: " + string.Join(" | ", debugTitles.Take(10)));
+        }
+
+        // PAD confirmation dialogs use a variety of titles.
+        // We search in priority order.
+        var titlePatterns = new[]
+        {
+            "Run flow",        // PAD 2.42+ connections dialog
+            "Run Flow",        // variant capitalisation
+            "Power Automate",  // generic PAD window
+            "Microsoft Power Automate",
+            "An external process",
+            "External Process",
+            "Confirm",
+            "Confirm Action"
+        };
 
         while (DateTime.UtcNow < deadline)
         {
-            // Try exact title first, then partial match.
-            var hWnd = FindWindow(null, "Run flow");
-            if (hWnd == IntPtr.Zero)
+            // 1) Try exact titles via FindWindow
+            foreach (var pattern in titlePatterns)
             {
-                // Some localized or variant titles contain "Run flow"
-                hWnd = FindWindowByPartialTitle("Run flow");
+                var hWnd = FindWindow(null, pattern);
+                if (hWnd != IntPtr.Zero && IsWindowVisible(hWnd))
+                {
+                    log("Information", $"Auto-confirm: detected dialog via exact title '{pattern}' (hWnd={hWnd}).");
+                    await TryConfirmDialog(hWnd, log, summary);
+                    return;
+                }
             }
 
-            if (hWnd != IntPtr.Zero)
+            // 2) Try partial title match against any visible window
+            var matched = FindWindowByPartialTitles(titlePatterns);
+            if (matched != IntPtr.Zero)
             {
-                log("Information", "Auto-confirm: detected 'Run flow' dialog. Sending Enter key...");
+                var title = GetWindowTitle(matched);
+                log("Information", $"Auto-confirm: detected dialog via partial title match '{title}' (hWnd={matched}).");
+                await TryConfirmDialog(matched, log, summary);
+                return;
+            }
+
+            // 3) Look for a child button with text "Run flow" inside any visible window.
+            // This catches dialogs where the *button* says "Run flow" but the window title is generic.
+            var buttonHwnd = FindButtonWithText("Run flow");
+            if (buttonHwnd == IntPtr.Zero)
+                buttonHwnd = FindButtonWithText("Run Flow");
+            if (buttonHwnd == IntPtr.Zero)
+                buttonHwnd = FindButtonWithText("Run");
+            if (buttonHwnd == IntPtr.Zero)
+                buttonHwnd = FindButtonWithText("OK");
+
+            if (buttonHwnd != IntPtr.Zero)
+            {
+                var parentTitle = GetWindowTitle(GetParent(buttonHwnd));
+                log("Information", $"Auto-confirm: found button inside window '{parentTitle}' (btn hWnd={buttonHwnd}). Clicking...");
                 summary.DialogAutoConfirmed = true;
-
-                SetForegroundWindow(hWnd);
-                await Task.Delay(200); // let the window activate
-
-                // Send Enter (VK_RETURN = 0x0D)
-                keybd_event(0x0D, 0, 0, UIntPtr.Zero);               // KEYDOWN
-                keybd_event(0x0D, 0, KEYEVENTF_KEYUP, UIntPtr.Zero); // KEYUP
-
-                log("Information", "Auto-confirm: Enter key sent to dialog.");
+                ClickButton(buttonHwnd);
+                log("Information", "Auto-confirm: button click sent.");
                 return;
             }
 
             await Task.Delay(500);
         }
 
-        var msg = "Auto-confirm: did not detect a 'Run flow' dialog within the timeout. If the dialog appeared and was not auto-confirmed, you may need to adjust the dialog title or use a different workaround.";
+        var msg = "Auto-confirm: did not detect a confirmation dialog within the timeout. If a dialog appeared and was not auto-confirmed, check the visible window titles in the logs above and report the exact dialog title.";
         log("Information", msg);
+
+        // Final diagnostic after timeout.
+        var finalTitles = GetVisibleWindowTitles();
+        if (finalTitles.Count > 0)
+        {
+            log("Information", "Visible top-level windows at timeout: " + string.Join(" | ", finalTitles.Take(10)));
+        }
     }
 
-    static IntPtr FindWindowByPartialTitle(string partialTitle)
+    static async Task TryConfirmDialog(IntPtr hWnd, Action<string, string> log, FlowSummary summary)
+    {
+        summary.DialogAutoConfirmed = true;
+
+        SetForegroundWindow(hWnd);
+        await Task.Delay(300);
+
+        // Method A: Send Enter key (works for most confirmation dialogs)
+        keybd_event(0x0D, 0, 0, UIntPtr.Zero);               // KEYDOWN
+        keybd_event(0x0D, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);   // KEYUP
+        log("Information", "Auto-confirm: Enter key sent to dialog.");
+
+        await Task.Delay(200);
+
+        // Method B: If the dialog is still visible, try sending Enter via PostMessage
+        // (directly to the window message queue, works even if foregrounding failed).
+        if (IsWindow(hWnd))
+        {
+            PostMessage(hWnd, WM_KEYDOWN, (IntPtr)VK_RETURN, IntPtr.Zero);
+            PostMessage(hWnd, WM_KEYUP, (IntPtr)VK_RETURN, IntPtr.Zero);
+            log("Information", "Auto-confirm: WM_KEYDOWN/KEYUP posted to dialog.");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Window / button helpers
+    // ------------------------------------------------------------------
+
+    static IntPtr FindWindowByPartialTitles(IEnumerable<string> partialTitles)
     {
         IntPtr found = IntPtr.Zero;
         EnumWindows((hWnd, lParam) =>
         {
-            var sb = new StringBuilder(256);
+            if (!IsWindowVisible(hWnd))
+                return true;
+
+            var sb = new StringBuilder(512);
             GetWindowText(hWnd, sb, sb.Capacity);
-            if (sb.ToString().Contains(partialTitle, StringComparison.OrdinalIgnoreCase))
+            var title = sb.ToString();
+
+            foreach (var pt in partialTitles)
             {
-                found = hWnd;
-                return false; // stop enumeration
+                if (title.Contains(pt, StringComparison.OrdinalIgnoreCase))
+                {
+                    found = hWnd;
+                    return false;
+                }
             }
             return true;
         }, IntPtr.Zero);
         return found;
     }
 
+    static string GetWindowTitle(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero) return "(none)";
+        var sb = new StringBuilder(512);
+        GetWindowText(hWnd, sb, sb.Capacity);
+        return sb.ToString();
+    }
+
+    static List<string> GetVisibleWindowTitles()
+    {
+        var list = new List<string>();
+        EnumWindows((hWnd, lParam) =>
+        {
+            if (IsWindowVisible(hWnd))
+            {
+                var sb = new StringBuilder(512);
+                GetWindowText(hWnd, sb, sb.Capacity);
+                var t = sb.ToString();
+                if (!string.IsNullOrWhiteSpace(t))
+                    list.Add(t);
+            }
+            return true;
+        }, IntPtr.Zero);
+        return list;
+    }
+
+    static IntPtr FindButtonWithText(string text)
+    {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows((hWnd, lParam) =>
+        {
+            if (!IsWindowVisible(hWnd))
+                return true;
+
+            found = FindWindowEx(hWnd, IntPtr.Zero, "Button", text);
+            if (found == IntPtr.Zero)
+            {
+                // Try partial button text match via EnumChildWindows
+                var target = text;
+                EnumChildWindows(hWnd, (child, _) =>
+                {
+                    var sb = new StringBuilder(256);
+                    GetWindowText(child, sb, sb.Capacity);
+                    if (sb.ToString().Contains(target, StringComparison.OrdinalIgnoreCase))
+                    {
+                        found = child;
+                        return false;
+                    }
+                    return true;
+                }, IntPtr.Zero);
+            }
+
+            return found == IntPtr.Zero; // stop top-level enum if we found the button
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    static void ClickButton(IntPtr hWnd)
+    {
+        // Send BM_CLICK to simulate a button click
+        SendMessage(hWnd, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    // ------------------------------------------------------------------
     // P/Invoke declarations
+    // ------------------------------------------------------------------
     const uint KEYEVENTF_KEYUP = 0x0002;
+    const int WM_KEYDOWN = 0x0100;
+    const int WM_KEYUP = 0x0101;
+    const int VK_RETURN = 0x0D;
+    const int BM_CLICK = 0x00F5;
 
     [DllImport("user32.dll", SetLastError = true)]
     static extern IntPtr FindWindow(string? lpClassName, string? lpWindowName);
@@ -760,10 +911,31 @@ class Program
     [DllImport("user32.dll")]
     static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
+    [DllImport("user32.dll")]
+    static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
     delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    [DllImport("user32.dll")]
+    static extern bool IsWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern IntPtr FindWindowEx(IntPtr hwndParent, IntPtr hwndChildAfter, string? lpszClass, string? lpszWindow);
+
+    [DllImport("user32.dll")]
+    static extern IntPtr GetParent(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    static extern bool PostMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
 }
 
 public class FlowSummary
