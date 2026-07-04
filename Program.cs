@@ -207,16 +207,19 @@ class Program
         log("Information", $"Run URL: {runUrl}");
 
         // ------------------------------------------------------------------
-        // Launch PAD.Console.Host.exe directly with the ms-powerautomate: URI
-        // as its argument. UseShellExecute=true ensures the process starts
-        // normally (not redirected), which is required for PAD to properly
-        // handle the URI and run the flow rather than opening it in edit mode.
+        // Launch PAD.Console.Host.exe with the ms-powerautomate: URI as its
+        // argument. UseShellExecute=false is critical: it uses CreateProcess
+        // which passes arguments directly without shell interpretation.
+        // With UseShellExecute=true, the shell interprets & in the URI query
+        // string as command separators, causing PAD to receive a partial URI
+        // and open the flow in edit mode instead of running it.
+        // Ref: https://learn.microsoft.com/power-automate/desktop-flows/run-desktop-flows-url-shortcuts
         // ------------------------------------------------------------------
         var psi = new ProcessStartInfo
         {
             FileName = padPath,
-            Arguments = runUrl,
-            UseShellExecute = true,
+            Arguments = $"\"{runUrl}\"",
+            UseShellExecute = false,
             WorkingDirectory = Path.GetDirectoryName(padPath) ?? AppContext.BaseDirectory
         };
 
