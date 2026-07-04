@@ -205,80 +205,39 @@ class Program
 
         log("Information", $"Starting desktop flow with timeout {timeoutMinutes} minutes.");
         log("Information", $"Run URL: {runUrl}");
-        log("Information", "Note: PAD.Console.Host.exe hands off to Power Automate and exits immediately; its exit code does not reflect the flow's actual run result. Use 'Flow:RunId' plus the on-disk logs to verify completion if needed.");
+        log("Information", "Note: the ms-powerautomate: URI is handed to Windows shell; the shell resolves the registered protocol handler (PAD.Console.Host.exe). The launcher process returns immediately and its exit code does not reflect the flow's actual run result.");
 
+        // ------------------------------------------------------------------
+        // Launch via the Windows URI protocol handler.
+        // ms-powerautomate: is a registered protocol. It MUST be invoked with
+        // UseShellExecute = true and the URI as FileName. Passing the URI as a
+        // command-line argument to PAD.Console.Host.exe directly causes Windows
+        // to treat it as a file to open, which shows an "Open with" dialog.
+        // ------------------------------------------------------------------
         var psi = new ProcessStartInfo
         {
-            FileName = padPath,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
+            FileName = runUrl,
+            UseShellExecute = true,
             WorkingDirectory = Path.GetDirectoryName(padPath) ?? AppContext.BaseDirectory
         };
-        psi.ArgumentList.Add(runUrl);
 
         using var process = new Process { StartInfo = psi };
-
-        var outputBuilder = new StringBuilder();
-        var errorBuilder = new StringBuilder();
-
-        process.OutputDataReceived += (_, e) =>
-        {
-            if (!string.IsNullOrWhiteSpace(e.Data))
-                outputBuilder.AppendLine(e.Data);
-        };
-        process.ErrorDataReceived += (_, e) =>
-        {
-            if (!string.IsNullOrWhiteSpace(e.Data))
-                errorBuilder.AppendLine(e.Data);
-        };
 
         var started = process.Start();
         if (!started)
         {
-            logError("Failed to start PAD.Console.Host.exe process.", null);
+            logError("Failed to launch the ms-powerautomate: URI via the Windows shell. The protocol handler may not be registered.", null);
             return 1;
         }
 
-        process.BeginOutputReadLine();
-        process.BeginErrorReadLine();
-
-        var timeoutMs = timeoutMinutes * 60 * 1000;
-        var completed = process.WaitForExit(timeoutMs);
-
-        if (!completed)
-        {
-            logError($"Desktop flow '{flowName}' timed out after {timeoutMinutes} minutes.", null);
-            try { process.Kill(); } catch { /* ignored */ }
-            return 1;
-        }
-
-        var output = outputBuilder.ToString().Trim();
-        var error = errorBuilder.ToString().Trim();
-
-        if (!string.IsNullOrWhiteSpace(output))
-            log("Information", $"PAD stdout: {output}");
-        if (!string.IsNullOrWhiteSpace(error))
-        {
-            log("Warning", $"PAD stderr: {error}");
-            summary.Warnings.Add($"PAD stderr: {error}");
-        }
-
-        log("Information", $"PAD exit code: {process.ExitCode}");
+        // Give the shell a moment to start the protocol handler.
+        await Task.Delay(2000);
 
         var flowLabel = flowName ?? workflowId;
         summary.FlowIdentifier = flowLabel;
-        summary.PadExitCode = process.ExitCode;
-        summary.DispatchSucceeded = process.ExitCode == 0;
+        summary.DispatchSucceeded = true;
 
-        if (process.ExitCode != 0)
-        {
-            logError($"PAD.Console.Host.exe exited with non-zero code {process.ExitCode} while dispatching flow '{flowLabel}'. This indicates the handoff itself failed (e.g. malformed URL); it does not confirm whether the flow ran.", null);
-            return process.ExitCode;
-        }
-
-        log("Information", $"Desktop flow '{flowLabel}' dispatched successfully to Power Automate.");
+        log("Information", $"Desktop flow '{flowLabel}' URI dispatched to Windows shell for protocol handling.");
 
         if (autoConfirmDialog)
         {
