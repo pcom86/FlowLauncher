@@ -151,7 +151,7 @@ class Program
         if (!string.IsNullOrWhiteSpace(workflowId))
             queryParts.Add($"workflowId={workflowId}");
         else
-            queryParts.Add($"workflowName={Uri.EscapeDataString(flowName!)}");
+            queryParts.Add($"workflowName={flowName}");
 
         if (!string.IsNullOrWhiteSpace(environmentId))
             queryParts.Add($"environmentid={environmentId}");
@@ -190,7 +190,8 @@ class Program
             if (jsonObject.Count > 0)
             {
                 var inputsJson = jsonObject.ToJsonString();
-                var escapedInputs = Uri.EscapeDataString(inputsJson);
+                // Per docs: escape double quotes with backslash, do NOT URL-encode.
+                var escapedInputs = inputsJson.Replace("\"", "\\\"");
                 queryParts.Add($"inputArguments={escapedInputs}");
                 log("Information", $"Flow inputs: {inputsJson}");
             }
@@ -207,19 +208,21 @@ class Program
         log("Information", $"Run URL: {runUrl}");
 
         // ------------------------------------------------------------------
-        // Launch PAD.Console.Host.exe with the ms-powerautomate: URI as its
-        // argument. UseShellExecute=false is critical: it uses CreateProcess
-        // which passes arguments directly without shell interpretation.
-        // With UseShellExecute=true, the shell interprets & in the URI query
-        // string as command separators, causing PAD to receive a partial URI
-        // and open the flow in edit mode instead of running it.
+        // Launch via cmd /c to exactly match the documented command-line syntax:
+        //   "C:\...\PAD.Console.Host.exe" "ms-powerautomate:/console/flow/run?..."
+        // Using cmd /c ensures the & characters in the URI query string are
+        // properly quoted and not interpreted as shell separators.
         // Ref: https://learn.microsoft.com/power-automate/desktop-flows/run-desktop-flows-url-shortcuts
         // ------------------------------------------------------------------
+        var cmdLine = $"/c \"\"{padPath}\" \"{runUrl}\"\"";
+        log("Information", $"Command: cmd {cmdLine}");
+
         var psi = new ProcessStartInfo
         {
-            FileName = padPath,
-            Arguments = $"\"{runUrl}\"",
+            FileName = "cmd.exe",
+            Arguments = cmdLine,
             UseShellExecute = false,
+            CreateNoWindow = true,
             WorkingDirectory = Path.GetDirectoryName(padPath) ?? AppContext.BaseDirectory
         };
 
