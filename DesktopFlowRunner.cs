@@ -80,8 +80,6 @@ static class DesktopFlowRunner
             return 1;
         }
 
-        await Task.Delay(2000);
-
         var flowLabel = flowName ?? workflowId;
         summary.FlowIdentifier = flowLabel;
         summary.DispatchSucceeded = true;
@@ -178,7 +176,7 @@ static class DesktopFlowRunner
         {
             try
             {
-                foreach (var d in Directory.EnumerateDirectories(scriptsRoot, "*", SearchOption.AllDirectories))
+                foreach (var d in Directory.EnumerateDirectories(scriptsRoot))
                     existingFolders.Add(d);
             }
             catch (IOException) { }
@@ -196,18 +194,15 @@ static class DesktopFlowRunner
             {
                 try
                 {
-                    runFolder = Directory.EnumerateDirectories(scriptsRoot, runId, SearchOption.AllDirectories).FirstOrDefault();
-
-                    if (runFolder == null)
+                    // Look for new top-level folders only (PAD creates run folders
+                    // directly under Scripts root, not nested).
+                    foreach (var d in Directory.EnumerateDirectories(scriptsRoot))
                     {
-                        foreach (var d in Directory.EnumerateDirectories(scriptsRoot, "*", SearchOption.AllDirectories))
+                        if (!existingFolders.Contains(d))
                         {
-                            if (!existingFolders.Contains(d))
-                            {
-                                runFolder = d;
-                                log("Information", $"Found new run folder: {runFolder}");
-                                break;
-                            }
+                            runFolder = d;
+                            log("Information", $"Found new run folder: {runFolder}");
+                            break;
                         }
                     }
                 }
@@ -219,7 +214,7 @@ static class DesktopFlowRunner
 
             var remaining = (deadline - DateTime.UtcNow).TotalSeconds;
             Console.Write($"\r  ⏳ Waiting for flow to start... {Math.Max(0, remaining):F0}s remaining   ");
-            await Task.Delay(2000);
+            await Task.Delay(500);
         }
 
         Console.WriteLine();
@@ -303,7 +298,7 @@ static class DesktopFlowRunner
                 Console.Write($"\r  │ {stepCount} actions completed │ elapsed {elapsed:mm\\:ss} │ idle {sinceLastLog:ss}s    ");
             }
 
-            await Task.Delay(2000);
+            await Task.Delay(1000);
         }
 
         Console.WriteLine("  └─────────────────────────────────────────────┘");
