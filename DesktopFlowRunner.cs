@@ -36,9 +36,7 @@ static class DesktopFlowRunner
         var padPath = ResolvePadConsoleHostPath(config, log);
         if (padPath == null)
         {
-            logError("PAD.Console.Host.exe not found. Install Power Automate Desktop or set Flow:PadConsoleHostPath.", null);
-            Console.WriteLine("  ❌ PAD.Console.Host.exe not found.");
-            return 1;
+            log("Information", "PAD.Console.Host.exe not found in standard paths. Will try launching via ms-powerautomate: protocol handler.");
         }
 
         Console.WriteLine($"  📋 Flow:     {flowName ?? workflowId}");
@@ -53,44 +51,56 @@ static class DesktopFlowRunner
         if (confirmationChanged || forceRestartPad)
             EnsurePadRestarted(forceRestartPad, log);
 
-        log("Information", $"PAD console host path: {padPath}");
-        summary.PadPath = padPath;
+        log("Information", $"PAD console host path: {padPath ?? "(not found — using protocol handler)"}");
+        summary.PadPath = padPath ?? "(protocol handler)";
 
         var runUrl = BuildRunUrl(config, workflowId, flowName, environmentId, autoLogin, runId, log);
 
         log("Information", $"Starting desktop flow with timeout {timeoutMinutes} minutes.");
         log("Information", $"Run URL: {runUrl}");
 
-        // Launch PAD.Console.Host.exe directly with the URI as its argument.
-        // This is the documented command-prompt approach from Microsoft:
-        //   "C:\...\PAD.Console.Host.exe" "ms-powerautomate:/console/flow/run?..."
-        // Using UseShellExecute=false ensures the URI is passed as a direct
-        // argument to the console host (which runs the flow), not routed
-        // through the shell protocol handler (which may open the designer).
-        var psi = new ProcessStartInfo
+        ProcessStartInfo psi;
+        if (padPath != null)
         {
-            FileName = padPath,
-            Arguments = $"\"{runUrl}\"",
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            WorkingDirectory = Path.GetDirectoryName(padPath) ?? AppContext.BaseDirectory
-        };
+            // Launch PAD.Console.Host.exe directly with the URI as its argument.
+            // This is the documented command-prompt approach from Microsoft.
+            log("Information", $"Launching PAD.Console.Host.exe at: {padPath}");
+            psi = new ProcessStartInfo
+            {
+                FileName = padPath,
+                Arguments = $"\"{runUrl}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = Path.GetDirectoryName(padPath) ?? AppContext.BaseDirectory
+            };
+        }
+        else
+        {
+            // Fallback: launch the URI via ShellExecute — Windows routes it
+            // to PAD's registered protocol handler (Microsoft Store install).
+            log("Information", "Launching via ms-powerautomate: protocol handler (ShellExecute).");
+            psi = new ProcessStartInfo
+            {
+                FileName = runUrl,
+                UseShellExecute = true
+            };
+        }
 
         using var process = new Process { StartInfo = psi };
 
         var started = process.Start();
         if (!started)
         {
-            logError("Failed to start PAD.Console.Host.exe with the run URI.", null);
+            logError("Failed to launch the desktop flow.", null);
             return 1;
         }
 
         var flowLabel = flowName ?? workflowId;
         summary.FlowIdentifier = flowLabel;
         summary.DispatchSucceeded = true;
-        summary.PadPath = padPath;
+        summary.PadPath = padPath ?? "(protocol handler)";
 
-        log("Information", $"Desktop flow '{flowLabel}' dispatched to PAD.Console.Host.exe.");
+        log("Information", $"Desktop flow '{flowLabel}' dispatched.");
         Console.WriteLine("  🚀 Flow dispatched to Power Automate Desktop");
         Console.WriteLine();
 
@@ -552,6 +562,8 @@ static class DesktopFlowRunner
         {
             try
             {
+                // Microsoft Store installs use a versioned folder name like:
+                // Microsoft.PowerAutomateDesktop_1.0.2094.0_x64__8wekyb3d8bbwe
                 var storeMatch = Directory.GetDirectories(windowsAppsRoot, "Microsoft.PowerAutomateDesktop_*")
                     .SelectMany(dir => Directory.GetFiles(dir, "PAD.Console.Host.exe", SearchOption.AllDirectories))
                     .FirstOrDefault();
@@ -562,7 +574,41 @@ static class DesktopFlowRunner
                     return storeMatch;
                 }
             }
-            catch (UnauthorizedAccessException) { }
+            catch (UnauthorizedAccessException ex)
+            {
+                log("Warning", $"Access denied searching WindowsApps for PAD: {ex.Message}. Will use protocol handler fallback.");
+            }
+        }
+
+        // Also try reading the AppX package registry to find the install path
+        try
+        {
+            using var packagesKey = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Applications");
+            if (packagesKey != null)
+            {
+                foreach (var subKeyName in packagesKey.GetSubKeyNames())
+                {
+                    if (!subKeyName.StartsWith("Microsoft.PowerAutomateDesktop", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    using var pkgKey = packagesKey.OpenSubKey(subKeyName);
+                    var installPath = pkgKey?.GetValue("Path") as string;
+                    if (!string.IsNullOrWhiteSpace(installPath))
+                    {
+                        var candidate = Path.Combine(installPath, "dotnet", "PAD.Console.Host.exe");
+                        if (File.Exists(candidate))
+                        {
+                            log("Information", $"Found PAD console host via AppX registry: {candidate}");
+                            return candidate;
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            log("Warning", $"Failed to read AppX registry: {ex.Message}");
         }
 
         return null;
