@@ -267,95 +267,189 @@ static class DesktopFlowRunner
         Console.WriteLine($"  ✅ Run folder detected");
         Console.WriteLine($"  📁 {runFolder}");
         Console.WriteLine();
-        Console.WriteLine("  ┌─ Flow Actions ──────────────────────────────┐");
 
         log("Information", $"Run folder detected: {runFolder}");
         summary.RunFolderPath = runFolder;
         var startTime = DateTime.UtcNow;
         var lastLogTime = DateTime.UtcNow;
+        var lastActivityTime = DateTime.UtcNow;
         int stepCount = 0;
         int linesShown = 0;
         string? actionsLogPath = null;
+        int lastFileCount = -1;
+        long lastFolderSize = -1;
+        var spinner = new[] { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+        int spinnerIdx = 0;
+        bool hasShownSteps = false;
 
         while (DateTime.UtcNow < deadline)
         {
-            // Try to locate Actions.log — it may be directly in the run folder
-            // or in a subdirectory. It may also not exist yet if PAD is still
-            // initializing the flow run.
+            // Try to locate Actions.log
             if (actionsLogPath == null || !File.Exists(actionsLogPath))
-            {
                 actionsLogPath = FindActionsLog(runFolder);
-            }
 
-            if (actionsLogPath == null)
-            {
-                var elapsed = DateTime.UtcNow - startTime;
-                Console.Write($"\r  ⏳ Flow starting up... looking for Actions.log │ elapsed {elapsed:mm\\:ss}    ");
-                await Task.Delay(500);
-                continue;
-            }
-
+            // Check if run folder was removed (flow completed)
             if (!Directory.Exists(runFolder))
             {
-                Console.WriteLine("  └─────────────────────────────────────────────┘");
+                // Flush any remaining log lines
+                if (actionsLogPath != null)
+                    ReadNewLines(actionsLogPath, ref linesShown, ref stepCount, log, ref hasShownSteps);
+
+                if (hasShownSteps)
+                    Console.WriteLine("  └─────────────────────────────────────────────┘");
                 Console.WriteLine();
                 Console.WriteLine($"  ✅ Flow completed — run folder cleaned up by Power Automate.");
                 log("Information", "Run folder was removed - the flow run has finished.");
                 return;
             }
 
-            var readAnyLine = false;
-            try
+            // Try to read new action lines from Actions.log
+            var readAnyNewLine = false;
+            if (actionsLogPath != null)
             {
-                // Read all lines each iteration and skip already-shown ones.
-                // This avoids StreamReader buffering position issues that
-                // caused the progress to get stuck.
-                var allLines = await File.ReadAllLinesAsync(actionsLogPath);
-                for (int i = 0; i < allLines.Length; i++)
+                try
                 {
-                    if (i < linesShown)
-                        continue;
-                    var line = allLines[i];
-                    if (string.IsNullOrWhiteSpace(line))
+                    var allLines = File.ReadAllLines(actionsLogPath);
+                    for (int i = 0; i < allLines.Length; i++)
                     {
+                        if (i < linesShown)
+                            continue;
+                        var line = allLines[i];
+                        if (string.IsNullOrWhiteSpace(line))
+                        {
+                            linesShown++;
+                            continue;
+                        }
+
+                        log("Information", $"[Flow Progress] {line}");
+
+                        var display = ExtractActionName(line);
                         linesShown++;
-                        continue;
+
+                        if (display == null)
+                            continue;
+
+                        if (!hasShownSteps)
+                        {
+                            Console.WriteLine("  ┌─ Flow Actions ──────────────────────────────┐");
+                            hasShownSteps = true;
+                        }
+
+                        stepCount++;
+                        var time = DateTime.Now.ToString("HH:mm:ss");
+                        var truncated = display.Length > 38 ? display[..35] + "..." : display;
+                        Console.WriteLine($"  │ #{stepCount,3} │ {time} │ {truncated}");
+                        readAnyNewLine = true;
+                        lastLogTime = DateTime.UtcNow;
+                        lastActivityTime = DateTime.UtcNow;
                     }
+                }
+                catch (IOException) { }
+            }
 
-                    log("Information", $"[Flow Progress] {line}");
+            // Monitor run folder for file activity (count + total size)
+            var (fileCount, folderSize) = GetFolderStats(runFolder);
+            var activityDetected = fileCount != lastFileCount || folderSize != lastFolderSize;
+            if (activityDetected && lastFileCount >= 0)
+            {
+                lastActivityTime = DateTime.UtcNow;
+                log("Information", $"Folder activity: {fileCount} files, {folderSize} bytes");
+            }
+            lastFileCount = fileCount;
+            lastFolderSize = folderSize;
 
-                    var display = ExtractActionName(line);
-                    linesShown++;
+            // Show animated progress bar
+            var elapsed = DateTime.UtcNow - startTime;
+            var sinceActivity = DateTime.UtcNow - lastActivityTime;
+            var spin = spinner[spinnerIdx % spinner.Length];
+            spinnerIdx++;
 
-                    if (display == null)
-                        continue;
-
-                    stepCount++;
-                    var time = DateTime.Now.ToString("HH:mm:ss");
-                    var truncated = display.Length > 38 ? display[..35] + "..." : display;
-                    Console.WriteLine($"  │ #{stepCount,3} │ {time} │ {truncated}");
-                    readAnyLine = true;
-                    lastLogTime = DateTime.UtcNow;
+            if (hasShownSteps)
+            {
+                // We've shown action lines — show compact status below
+                if (!readAnyNewLine)
+                {
+                    Console.Write($"\r  │ {spin} {stepCount} actions │ {elapsed:mm\\:ss} elapsed │ {sinceActivity:ss}s since activity   ");
                 }
             }
-            catch (IOException) { }
-
-            if (!readAnyLine)
+            else
             {
-                var elapsed = DateTime.UtcNow - startTime;
-                var sinceLastLog = DateTime.UtcNow - lastLogTime;
-                Console.Write($"\r  │ {stepCount} actions completed │ elapsed {elapsed:mm\\:ss} │ idle {sinceLastLog:ss}s    ");
+                // No action lines yet — show progress bar
+                var barWidth = 20;
+                var elapsedSec = (int)elapsed.TotalSeconds;
+                var filled = elapsedSec % barWidth;
+                var bar = new string('█', filled) + new string('░', barWidth - filled);
+                var status = actionsLogPath == null ? "starting up" : "running";
+                var activityInfo = fileCount > 0 ? $" │ {fileCount} files" : "";
+                Console.Write($"\r  {spin} [{bar}] {elapsed:mm\\:ss} │ {status}{activityInfo}                    ");
             }
 
-            await Task.Delay(1000);
+            await Task.Delay(500);
         }
 
-        Console.WriteLine("  └─────────────────────────────────────────────┘");
+        if (hasShownSteps)
+            Console.WriteLine("  └─────────────────────────────────────────────┘");
         Console.WriteLine();
         var timeoutMsg = $"Timed out after {timeoutMinutes} minutes. The flow may still be running.";
         Console.WriteLine($"  ⚠️  {timeoutMsg}");
         log("Warning", timeoutMsg);
         summary.Warnings.Add(timeoutMsg);
+    }
+
+    static void ReadNewLines(string actionsLogPath, ref int linesShown, ref int stepCount, Action<string, string> log, ref bool hasShownSteps)
+    {
+        try
+        {
+            var allLines = File.ReadAllLines(actionsLogPath);
+            for (int i = 0; i < allLines.Length; i++)
+            {
+                if (i < linesShown)
+                    continue;
+                var line = allLines[i];
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    linesShown++;
+                    continue;
+                }
+
+                log("Information", $"[Flow Progress] {line}");
+
+                var display = ExtractActionName(line);
+                linesShown++;
+
+                if (display == null)
+                    continue;
+
+                if (!hasShownSteps)
+                {
+                    Console.WriteLine("  ┌─ Flow Actions ──────────────────────────────┐");
+                    hasShownSteps = true;
+                }
+
+                stepCount++;
+                var time = DateTime.Now.ToString("HH:mm:ss");
+                var truncated = display.Length > 38 ? display[..35] + "..." : display;
+                Console.WriteLine($"  │ #{stepCount,3} │ {time} │ {truncated}");
+            }
+        }
+        catch (IOException) { }
+    }
+
+    static (int count, long size) GetFolderStats(string folder)
+    {
+        try
+        {
+            var files = Directory.EnumerateFiles(folder, "*", SearchOption.AllDirectories);
+            int count = 0;
+            long size = 0;
+            foreach (var f in files)
+            {
+                count++;
+                try { size += new FileInfo(f).Length; } catch { }
+            }
+            return (count, size);
+        }
+        catch (IOException) { return (-1, -1); }
     }
 
     static string? FindActionsLog(string runFolder)
