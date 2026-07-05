@@ -171,18 +171,30 @@ static class DesktopFlowRunner
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "Microsoft", "Power Automate Desktop", "Console", "Scripts");
 
+        // PAD stores run logs at: Scripts/[FlowID]/Runs/[RunID]
+        // Not directly under Scripts root.
         log("Information", $"Watching for run folder under '{scriptsRoot}' (RunId: {runId})");
 
         var deadline = DateTime.UtcNow.AddMinutes(timeoutMinutes);
         string? runFolder = null;
 
-        var existingFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Snapshot existing run folders so we can detect new ones.
+        // Scan Scripts/*/Runs/ for existing run folders.
+        var existingRunFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (Directory.Exists(scriptsRoot))
         {
             try
             {
-                foreach (var d in Directory.EnumerateDirectories(scriptsRoot))
-                    existingFolders.Add(d);
+                // Each flow has its own folder under Scripts, each containing a Runs subfolder
+                foreach (var flowDir in Directory.EnumerateDirectories(scriptsRoot))
+                {
+                    var runsDir = Path.Combine(flowDir, "Runs");
+                    if (Directory.Exists(runsDir))
+                    {
+                        foreach (var runDir in Directory.EnumerateDirectories(runsDir))
+                            existingRunFolders.Add(runDir);
+                    }
+                }
             }
             catch (IOException) { }
         }
@@ -199,16 +211,35 @@ static class DesktopFlowRunner
             {
                 try
                 {
-                    // Look for new top-level folders only (PAD creates run folders
-                    // directly under Scripts root, not nested).
-                    foreach (var d in Directory.EnumerateDirectories(scriptsRoot))
+                    // Look for new run folders under Scripts/*/Runs/
+                    foreach (var flowDir in Directory.EnumerateDirectories(scriptsRoot))
                     {
-                        if (!existingFolders.Contains(d))
+                        var runsDir = Path.Combine(flowDir, "Runs");
+                        if (!Directory.Exists(runsDir))
+                            continue;
+
+                        // First try exact match by runId
+                        var exactMatch = Path.Combine(runsDir, runId);
+                        if (Directory.Exists(exactMatch))
                         {
-                            runFolder = d;
-                            log("Information", $"Found new run folder: {runFolder}");
+                            runFolder = exactMatch;
+                            log("Information", $"Found run folder by RunId match: {runFolder}");
                             break;
                         }
+
+                        // Otherwise look for any new folder
+                        foreach (var runDir in Directory.EnumerateDirectories(runsDir))
+                        {
+                            if (!existingRunFolders.Contains(runDir))
+                            {
+                                runFolder = runDir;
+                                log("Information", $"Found new run folder: {runFolder}");
+                                break;
+                            }
+                        }
+
+                        if (runFolder != null)
+                            break;
                     }
                 }
                 catch (IOException) { }
@@ -240,14 +271,30 @@ static class DesktopFlowRunner
 
         log("Information", $"Run folder detected: {runFolder}");
         summary.RunFolderPath = runFolder;
-        var actionsLogPath = Path.Combine(runFolder, "Actions.log");
         var startTime = DateTime.UtcNow;
         var lastLogTime = DateTime.UtcNow;
         int stepCount = 0;
         int linesShown = 0;
+        string? actionsLogPath = null;
 
         while (DateTime.UtcNow < deadline)
         {
+            // Try to locate Actions.log — it may be directly in the run folder
+            // or in a subdirectory. It may also not exist yet if PAD is still
+            // initializing the flow run.
+            if (actionsLogPath == null || !File.Exists(actionsLogPath))
+            {
+                actionsLogPath = FindActionsLog(runFolder);
+            }
+
+            if (actionsLogPath == null)
+            {
+                var elapsed = DateTime.UtcNow - startTime;
+                Console.Write($"\r  ⏳ Flow starting up... looking for Actions.log │ elapsed {elapsed:mm\\:ss}    ");
+                await Task.Delay(500);
+                continue;
+            }
+
             if (!Directory.Exists(runFolder))
             {
                 Console.WriteLine("  └─────────────────────────────────────────────┘");
@@ -258,43 +305,40 @@ static class DesktopFlowRunner
             }
 
             var readAnyLine = false;
-            if (File.Exists(actionsLogPath))
+            try
             {
-                try
+                // Read all lines each iteration and skip already-shown ones.
+                // This avoids StreamReader buffering position issues that
+                // caused the progress to get stuck.
+                var allLines = await File.ReadAllLinesAsync(actionsLogPath);
+                for (int i = 0; i < allLines.Length; i++)
                 {
-                    // Read all lines each iteration and skip already-shown ones.
-                    // This avoids StreamReader buffering position issues that
-                    // caused the progress to get stuck.
-                    var allLines = await File.ReadAllLinesAsync(actionsLogPath);
-                    for (int i = 0; i < allLines.Length; i++)
+                    if (i < linesShown)
+                        continue;
+                    var line = allLines[i];
+                    if (string.IsNullOrWhiteSpace(line))
                     {
-                        if (i < linesShown)
-                            continue;
-                        var line = allLines[i];
-                        if (string.IsNullOrWhiteSpace(line))
-                        {
-                            linesShown++;
-                            continue;
-                        }
-
-                        log("Information", $"[Flow Progress] {line}");
-
-                        var display = ExtractActionName(line);
                         linesShown++;
-
-                        if (display == null)
-                            continue;
-
-                        stepCount++;
-                        var time = DateTime.Now.ToString("HH:mm:ss");
-                        var truncated = display.Length > 38 ? display[..35] + "..." : display;
-                        Console.WriteLine($"  │ #{stepCount,3} │ {time} │ {truncated}");
-                        readAnyLine = true;
-                        lastLogTime = DateTime.UtcNow;
+                        continue;
                     }
+
+                    log("Information", $"[Flow Progress] {line}");
+
+                    var display = ExtractActionName(line);
+                    linesShown++;
+
+                    if (display == null)
+                        continue;
+
+                    stepCount++;
+                    var time = DateTime.Now.ToString("HH:mm:ss");
+                    var truncated = display.Length > 38 ? display[..35] + "..." : display;
+                    Console.WriteLine($"  │ #{stepCount,3} │ {time} │ {truncated}");
+                    readAnyLine = true;
+                    lastLogTime = DateTime.UtcNow;
                 }
-                catch (IOException) { }
             }
+            catch (IOException) { }
 
             if (!readAnyLine)
             {
@@ -312,6 +356,24 @@ static class DesktopFlowRunner
         Console.WriteLine($"  ⚠️  {timeoutMsg}");
         log("Warning", timeoutMsg);
         summary.Warnings.Add(timeoutMsg);
+    }
+
+    static string? FindActionsLog(string runFolder)
+    {
+        // Check directly in the run folder
+        var directPath = Path.Combine(runFolder, "Actions.log");
+        if (File.Exists(directPath))
+            return directPath;
+
+        // Search subdirectories (PAD may nest it)
+        try
+        {
+            var match = Directory.EnumerateFiles(runFolder, "Actions.log", SearchOption.AllDirectories).FirstOrDefault();
+            return match;
+        }
+        catch (IOException) { }
+
+        return null;
     }
 
     static string? ExtractActionName(string line)
