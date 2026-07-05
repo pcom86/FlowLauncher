@@ -9,14 +9,21 @@ static class CloudFlowRunner
     public static async Task<int> RunAsync(IConfiguration config, Action<string, string> log, Action<string, Exception?> logError, FlowSummary summary)
     {
         var triggerUrl = config["Flow:HttpTriggerUrl"];
+        var flowName = config["Flow:Name"];
         var timeoutMinutes = config.GetValue<int?>("Flow:TimeoutMinutes") ?? 5;
         summary.TriggerUrl = triggerUrl;
 
         if (string.IsNullOrWhiteSpace(triggerUrl))
         {
             logError("Configuration missing: Flow:HttpTriggerUrl is required for cloud flows.", null);
+            Console.WriteLine("  ❌ Configuration missing: Flow:HttpTriggerUrl is required for cloud flows.");
             return 1;
         }
+
+        Console.WriteLine($"  📋 Flow:     {flowName ?? "Cloud Flow"}");
+        Console.WriteLine($"  🔧 Type:     Cloud");
+        Console.WriteLine($"  ⏱️  Timeout:  {timeoutMinutes} min");
+        Console.WriteLine();
 
         using var client = new HttpClient();
         client.Timeout = TimeSpan.FromMinutes(timeoutMinutes);
@@ -66,8 +73,12 @@ static class CloudFlowRunner
             }
 
             log("Information", "Cloud flow triggered successfully.");
+            summary.FlowIdentifier = flowName ?? "Cloud Flow";
             summary.HttpStatusCode = (int)response.StatusCode;
             summary.HasAsyncPolling = response.StatusCode == System.Net.HttpStatusCode.Accepted && response.Headers.Location != null;
+
+            Console.WriteLine("  🚀 Cloud flow triggered");
+            Console.WriteLine();
 
             var showProgress = config.GetValue<bool?>("Flow:ShowProgress") ?? true;
             if (showProgress && response.StatusCode == System.Net.HttpStatusCode.Accepted && response.Headers.Location != null)
