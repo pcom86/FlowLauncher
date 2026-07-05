@@ -61,14 +61,19 @@ static class DesktopFlowRunner
         log("Information", $"Starting desktop flow with timeout {timeoutMinutes} minutes.");
         log("Information", $"Run URL: {runUrl}");
 
-        // Launch the ms-powerautomate: URI directly via ShellExecute.
-        // Windows routes it to PAD's registered protocol handler, which handles
-        // all quoting internally. This avoids cmd.exe mangling the & and \"
-        // characters in the URI query string.
+        // Launch PAD.Console.Host.exe directly with the URI as its argument.
+        // This is the documented command-prompt approach from Microsoft:
+        //   "C:\...\PAD.Console.Host.exe" "ms-powerautomate:/console/flow/run?..."
+        // Using UseShellExecute=false ensures the URI is passed as a direct
+        // argument to the console host (which runs the flow), not routed
+        // through the shell protocol handler (which may open the designer).
         var psi = new ProcessStartInfo
         {
-            FileName = runUrl,
-            UseShellExecute = true
+            FileName = padPath,
+            Arguments = $"\"{runUrl}\"",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = Path.GetDirectoryName(padPath) ?? AppContext.BaseDirectory
         };
 
         using var process = new Process { StartInfo = psi };
@@ -76,7 +81,7 @@ static class DesktopFlowRunner
         var started = process.Start();
         if (!started)
         {
-            logError("Failed to launch the ms-powerautomate: URI.", null);
+            logError("Failed to start PAD.Console.Host.exe with the run URI.", null);
             return 1;
         }
 
@@ -111,7 +116,7 @@ static class DesktopFlowRunner
         if (!string.IsNullOrWhiteSpace(workflowId))
             queryParts.Add($"workflowId={workflowId}");
         else
-            queryParts.Add($"workflowName={Uri.EscapeDataString(flowName!)}");
+            queryParts.Add($"workflowName={flowName}");
 
         if (!string.IsNullOrWhiteSpace(environmentId))
             queryParts.Add($"environmentid={environmentId}");
@@ -146,8 +151,8 @@ static class DesktopFlowRunner
             if (jsonObject.Count > 0)
             {
                 var inputsJson = jsonObject.ToJsonString();
-                var encodedInputs = Uri.EscapeDataString(inputsJson);
-                queryParts.Add($"inputArguments={encodedInputs}");
+                var escapedInputs = inputsJson.Replace("\"", "\\\"");
+                queryParts.Add($"inputArguments={escapedInputs}");
                 log("Information", $"Flow inputs: {inputsJson}");
             }
         }
